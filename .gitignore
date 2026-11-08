@@ -1,0 +1,4 @@
+pi/.venv/
+pi/data/
+pi/__pycache__/
+pi/tests/__pycache__/
