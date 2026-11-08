@@ -5,9 +5,10 @@
     python main.py --port /dev/ttyUSB0
 
 Then type commands at the  esp32>  prompt:
-    on 5        run the motor for 5 seconds
-    off         stop the motor
-    status      is the motor running? how long is left?
+    on 5        move the servo to its "on" angle, hold 5 seconds, then back to rest
+    on 5 90     same, but to 90 degrees
+    off         back to rest now
+    status      is it holding? how long is left? what angle?
     rain        read the rain sensor once
     watch 2     read the rain sensor every 2 seconds (Ctrl+C to stop)
     ping        check the ESP32 is answering
@@ -26,7 +27,8 @@ def print_event(evt: dict) -> None:
     if evt.get("event") == "motor":
         state = "RUNNING" if evt["running"] else "STOPPED"
         reasons = {"started": "started", "timer": "time is up", "stopped": "stopped by command"}
-        print(f"\n  [motor {state}] {reasons.get(evt.get('reason'), evt.get('reason'))}")
+        angle = f" (servo at {evt['angle']}°)" if "angle" in evt else ""
+        print(f"\n  [motor {state}] {reasons.get(evt.get('reason'), evt.get('reason'))}{angle}")
     elif evt.get("event") == "ready":
         print("\n  [ESP32 restarted]")
 
@@ -56,12 +58,14 @@ class Shell(cmd.Cmd):
         pass
 
     def do_on(self, arg):
-        """on SECONDS : run the motor for SECONDS seconds"""
-        if not arg.strip():
-            print("  usage: on SECONDS")
+        """on SECONDS [ANGLE] : move the servo (to ANGLE 0-180 if given), hold SECONDS, then back to rest"""
+        parts = arg.split()
+        if not 1 <= len(parts) <= 2:
+            print("  usage: on SECONDS [ANGLE]")
             return
-        s = self.esp.motor_on(float(arg))
-        print(f"  motor on for {s.remaining_s:.1f} s")
+        angle = int(parts[1]) if len(parts) == 2 else None
+        s = self.esp.motor_on(float(parts[0]), angle)
+        print(f"  servo at {s.angle}° for {s.remaining_s:.1f} s")
 
     def do_off(self, arg):
         """off : stop the motor now"""
@@ -71,7 +75,10 @@ class Shell(cmd.Cmd):
     def do_status(self, arg):
         """status : is the motor running, and how long is left"""
         s = self.esp.motor_status()
-        print(f"  motor RUNNING, {s.remaining_s:.1f} s left" if s.running else "  motor STOPPED")
+        if s.running:
+            print(f"  motor RUNNING at {s.angle}°, {s.remaining_s:.1f} s left")
+        else:
+            print(f"  motor STOPPED (resting at {s.angle}°)")
 
     def do_rain(self, arg):
         """rain : read the rain sensor once"""

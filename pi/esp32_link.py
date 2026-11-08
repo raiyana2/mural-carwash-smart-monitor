@@ -3,8 +3,9 @@
     from esp32_link import Esp32Link
 
     with Esp32Link() as esp:            # finds the ESP32's USB port automatically
-        esp.motor_on(5)                  # run the motor for 5 seconds
-        print(esp.motor_status())        # MotorStatus(running=True, remaining_s=4.9)
+        esp.motor_on(5)                  # servo to its "on" angle for 5 seconds
+        esp.motor_on(5, angle=90)        # ...or to a specific angle (after the first one ends)
+        print(esp.motor_status())        # MotorStatus(running=True, remaining_s=4.9, angle=180)
         esp.wait_until_motor_stops()
         print(esp.read_rain())           # RainReading(raw=1830, wet_percent=55.3, raining=True)
 
@@ -39,8 +40,9 @@ class Esp32Error(Exception):
 
 @dataclass
 class MotorStatus:
-    running: bool
-    remaining_s: float
+    running: bool        # True while the servo is holding its "on" angle
+    remaining_s: float   # seconds left before it returns to rest
+    angle: int | None = None  # current servo angle (0-180)
 
 
 @dataclass
@@ -140,11 +142,17 @@ class Esp32Link:
         """Returns the ESP32's uptime in seconds."""
         return self._request("ping", timeout=timeout)["uptime_s"]
 
-    def motor_on(self, seconds: float) -> MotorStatus:
-        """Run the motor for `seconds`. The ESP32 stops it by itself when time is up."""
+    def motor_on(self, seconds: float, angle: int | None = None) -> MotorStatus:
+        """Move the servo to `angle` (default: the firmware's SERVO_ACTIVE_ANGLE),
+        hold it for `seconds`, then the ESP32 returns it to rest by itself."""
         if seconds <= 0:
             raise ValueError("seconds must be > 0")
-        return self._motor_reply(self._request("motor_on", seconds=seconds))
+        if angle is not None and not 0 <= angle <= 180:
+            raise ValueError("angle must be 0-180")
+        fields = {"seconds": seconds}
+        if angle is not None:
+            fields["angle"] = int(angle)
+        return self._motor_reply(self._request("motor_on", **fields))
 
     def motor_off(self) -> MotorStatus:
         return self._motor_reply(self._request("motor_off"))
@@ -155,6 +163,11 @@ class Esp32Link:
     def read_rain(self) -> RainReading:
         d = self._request("rain")
         return RainReading(raw=d["raw"], wet_percent=d["wet_percent"], raining=d["raining"])
+
+    @property
+    def connected(self) -> bool:
+        """True while the port is open and the background reader is still running."""
+        return bool(self._ser and self._ser.is_open and self._reader and self._reader.is_alive())
 
     @property
     def motor_running(self) -> bool:
@@ -176,7 +189,9 @@ class Esp32Link:
             self._motor_stopped.set()
 
     def _motor_reply(self, data: dict) -> MotorStatus:
-        status = MotorStatus(running=data["running"], remaining_s=data["remaining_s"])
+        status = MotorStatus(
+            running=data["running"], remaining_s=data["remaining_s"], angle=data.get("angle")
+        )
         self._set_motor_running(status.running)
         return status
 
