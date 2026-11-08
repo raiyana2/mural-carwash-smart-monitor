@@ -192,7 +192,7 @@ class Controller:
         def do(link: Esp32Link) -> str:
             s = link.motor_off()
             self._apply_motor(s.running, s.angle, 0)
-            return "Servo back to rest"
+            return f"Servo back to {s.angle}°"
         # Not logged here: the ESP32's "stopped" event already adds a log line.
         return self._action(do, log_success=False)
 
@@ -319,7 +319,7 @@ class Controller:
                 # this event and sends the update; notifying now would briefly show 0 s left.
                 return
             why = {"timer": "time is up", "stopped": "stopped"}.get(evt.get("reason"), evt.get("reason"))
-            self._add_log(f"Servo back to rest ({why})")
+            self._add_log(f"Servo back to {evt.get('angle')}° ({why})")
         elif evt.get("event") == "servo":
             # Sent on every angle change: manual servo_set moves and timed holds.
             running = bool(evt.get("running"))

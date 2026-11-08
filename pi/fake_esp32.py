@@ -23,7 +23,7 @@ tty.setraw(slave)
 print(f"fake ESP32 listening on {os.ttyname(slave)}", flush=True)
 
 booted = time.monotonic()
-servo = {"angle": REST_ANGLE, "running": False, "until": 0.0}   # running = timed hold active
+servo = {"angle": REST_ANGLE, "running": False, "until": 0.0, "return_to": REST_ANGLE}
 
 
 def send(obj):
@@ -44,7 +44,7 @@ def hold_stop(reason):
     if not servo["running"]:
         return
     servo["running"] = False
-    set_angle(REST_ANGLE)
+    set_angle(servo["return_to"])
     motor_event(reason)
 
 
@@ -83,7 +83,7 @@ def handle(req):
         elif servo["running"]:
             ok, err = False, "motor already running"
         else:
-            servo.update(running=True, until=time.monotonic() + s)
+            servo.update(running=True, until=time.monotonic() + s, return_to=servo["angle"])
             set_angle(angle)
             motor_event("started")
         data = status()

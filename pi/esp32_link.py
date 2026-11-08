@@ -4,7 +4,7 @@
 
     with Esp32Link() as esp:            # finds the ESP32's USB port automatically
         esp.servo_set(90)                # move to 90° and stay there
-        esp.motor_on(5)                  # timed hold: servo to its "on" angle for 5 s, then back to rest
+        esp.motor_on(5)                  # timed hold: servo to its "on" angle for 5 s, then back to where it was
         esp.motor_on(5, angle=90)        # ...or to a specific angle (after the first one ends)
         print(esp.motor_status())        # MotorStatus(running=True, remaining_s=4.9, angle=180)
         esp.wait_until_motor_stops()
@@ -42,7 +42,7 @@ class Esp32Error(Exception):
 @dataclass
 class MotorStatus:
     running: bool        # True while the servo is holding its "on" angle
-    remaining_s: float   # seconds left before it returns to rest
+    remaining_s: float   # seconds left before it returns to its original angle
     angle: int | None = None  # current servo angle (0-180)
 
 
@@ -146,7 +146,7 @@ class Esp32Link:
 
     def motor_on(self, seconds: float, angle: int | None = None) -> MotorStatus:
         """Move the servo to `angle` (default: the firmware's SERVO_ACTIVE_ANGLE),
-        hold it for `seconds`, then the ESP32 returns it to rest by itself."""
+        hold it for `seconds`, then the ESP32 returns it to the angle it was at before, by itself."""
         if seconds <= 0:
             raise ValueError("seconds must be > 0")
         if angle is not None and not 0 <= angle <= 180:

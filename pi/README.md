@@ -47,7 +47,7 @@ esp32> watch 2
 
 Commands: `angle DEGREES`, `on SECONDS [ANGLE]`, `off`, `status`, `rain`, `watch [SECONDS]`, `ping`, `help`, `quit`.
 
-`angle` moves the servo and leaves it there. `on` is a timed hold: it moves the servo to ANGLE (0–180; default set by `SERVO_ACTIVE_ANGLE` in the firmware), holds it for SECONDS, then the ESP32 returns it to its rest angle. `angle` is refused while a timed hold is running.
+`angle` moves the servo and leaves it there. `on` is a timed hold: it moves the servo to ANGLE (0–180; default set by `SERVO_ACTIVE_ANGLE` in the firmware), holds it for SECONDS, then the ESP32 returns it to the angle it was at before the hold started. `angle` is refused while a timed hold is running.
 
 ## In your own code
 
@@ -88,7 +88,7 @@ A UI should talk only to `Controller`, never to `Esp32Link` directly. The contro
 - has **button-style actions** that never crash. They return `ActionResult(ok, message)`, ready to show to the user.
 - **reads the rain sensor** in the background, every 2 s by default
 - **reconnects by itself** if the cable is pulled or the ESP32 restarts
-- keeps a **log** of what happened (connected, started, back to rest, errors)
+- keeps a **log** of what happened (connected, started, returned, errors)
 
 ```python
 from controller import Controller

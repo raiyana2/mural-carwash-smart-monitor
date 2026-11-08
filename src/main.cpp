@@ -10,8 +10,9 @@
     {"id":1,"cmd":"servo_set","angle":90}              move to 90° and stay there
     {"id":2,"cmd":"servo_status"}                      current angle (+ timed-hold info)
     {"id":3,"cmd":"motor_on","seconds":5}              timed hold: go to SERVO_ACTIVE_ANGLE,
-    {"id":4,"cmd":"motor_on","seconds":5,"angle":90}     hold N seconds, then back to rest
-    {"id":5,"cmd":"motor_off"}                         end a timed hold now (back to rest)
+    {"id":4,"cmd":"motor_on","seconds":5,"angle":90}     hold N seconds, then back to the angle
+                                                       it was at before the hold started
+    {"id":5,"cmd":"motor_off"}                         end a timed hold now (back to that angle)
     {"id":6,"cmd":"motor_status"}                      is a timed hold running? time left?
     {"id":7,"cmd":"rain"}                              read the rain sensor
     {"id":8,"cmd":"ping"}                              check the ESP32 is alive
@@ -41,6 +42,7 @@ int currentAngle = SERVO_REST_ANGLE;
 bool holdRunning = false;           // a timed hold (motor_on) is in progress
 unsigned long holdStartedAt = 0;    // millis() when it started
 unsigned long holdMs = 0;           // how long it lasts
+int holdReturnAngle = SERVO_REST_ANGLE;  // angle to go back to when the hold ends
 
 char line[256];                     // incoming line from the Pi
 size_t lineLen = 0;
@@ -89,6 +91,7 @@ void holdStart(float seconds, int angle) {
   holdStartedAt = millis();
   holdMs = (unsigned long)(seconds * 1000.0f);
   holdRunning = true;
+  holdReturnAngle = currentAngle;    // remember where we started from
   setServoAngle(angle);
   sendMotorEvent("started");
 }
@@ -97,7 +100,7 @@ void holdStop(const char* reason) {
   if (!holdRunning) return;          // nothing to stop: leave the servo where it is
   holdRunning = false;
   holdMs = 0;
-  setServoAngle(SERVO_REST_ANGLE);
+  setServoAngle(holdReturnAngle);    // back to where it was before the hold
   sendMotorEvent(reason);
 }
 
@@ -214,7 +217,7 @@ void setup() {
 
   myServo.setPeriodHertz(50);                        // standard servo signal: 50 pulses per second
   myServo.attach(SERVO_PIN, SERVO_MIN_US, SERVO_MAX_US);
-  setServoAngle(SERVO_REST_ANGLE);                   // note: the servo moves to rest at power-up
+  setServoAngle(SERVO_REST_ANGLE);                   // note: the servo moves here at power-up
 
   pinMode(RAIN_DIGITAL_PIN, INPUT);
   analogReadResolution(12);

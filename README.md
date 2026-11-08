@@ -26,7 +26,7 @@ Raspberry Pi (pi/)  ──USB serial──>  ESP32 (src/, PlatformIO)  ──>  
 | GPIO 34 | Rain sensor AO | Analog wetness (0–4095, lower = wetter) |
 | GPIO 39 | Rain sensor DO | LOW = wet. Set the threshold with the knob on the sensor board. |
 
-`config.h` also sets `SERVO_REST_ANGLE` (0, where the servo sits at power-up and after a timed hold), `SERVO_ACTIVE_ANGLE` (180, the default angle for `motor_on`), `SERVO_MIN_US`/`SERVO_MAX_US` (pulse widths) and `MAX_RUN_SECONDS` (300).
+`config.h` also sets `SERVO_REST_ANGLE` (0, where the servo goes at power-up), `SERVO_ACTIVE_ANGLE` (180, the default angle for `motor_on`), `SERVO_MIN_US`/`SERVO_MAX_US` (pulse widths) and `MAX_RUN_SECONDS` (300).
 
 ### Protocol
 
@@ -37,9 +37,9 @@ Every message is one JSON object per line, at 115200 baud. Each request has an `
 |---|---|---|
 | `{"id":1,"cmd":"servo_set","angle":90}` | Move to 90° and **stay there** | `{"angle":90,"running":false,"remaining_s":0}` |
 | `{"id":2,"cmd":"servo_status"}` | Current angle | same as above |
-| `{"id":3,"cmd":"motor_on","seconds":5}` | **Timed hold:** go to `SERVO_ACTIVE_ANGLE`, hold 5 s, then back to rest | `{"angle":180,"running":true,"remaining_s":5.0}` |
+| `{"id":3,"cmd":"motor_on","seconds":5}` | **Timed hold:** go to `SERVO_ACTIVE_ANGLE`, hold 5 s, then back to the angle it was at before | `{"angle":180,"running":true,"remaining_s":5.0}` |
 | `{"id":4,"cmd":"motor_on","seconds":5,"angle":90}` | Timed hold at 90° | |
-| `{"id":5,"cmd":"motor_off"}` | End a timed hold now, back to rest | |
+| `{"id":5,"cmd":"motor_off"}` | End a timed hold now, back to the angle it was at before | |
 | `{"id":6,"cmd":"motor_status"}` | Same as `servo_status` | |
 | `{"id":7,"cmd":"rain"}` | Read the rain sensor (average of 10 readings) | `{"raw":1830,"wet_percent":55.3,"raining":true}` |
 | `{"id":8,"cmd":"ping"}` | Check the ESP32 is alive | `{"uptime_s":42.0}` |
@@ -55,4 +55,4 @@ Events the ESP32 sends on its own:
 - `{"type":"event","event":"servo","angle":90,"running":false}` on every angle change
 - `{"type":"event","event":"motor","running":true,"reason":"started","angle":180}`, and later `"running":false` with `"reason":"timer"` or `"stopped"`
 
-The timed hold's timer runs on the ESP32, so the servo returns to rest on time even if the Pi crashes or the USB cable is pulled.
+The timed hold's timer runs on the ESP32, so the servo returns to its original angle on time even if the Pi crashes or the USB cable is pulled.

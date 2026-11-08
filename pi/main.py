@@ -6,9 +6,9 @@
 
 Then type commands at the  esp32>  prompt:
     angle 90    move the servo to 90 degrees and leave it there
-    on 5        timed hold: servo to its "on" angle, hold 5 seconds, then back to rest
+    on 5        timed hold: servo to its "on" angle, hold 5 seconds, then back to where it was
     on 5 90     same, but to 90 degrees
-    off         end a timed hold now (back to rest)
+    off         end a timed hold now (back to where it was)
     status      is it holding? how long is left? what angle?
     rain        read the rain sensor once
     watch 2     read the rain sensor every 2 seconds (Ctrl+C to stop)
@@ -59,7 +59,7 @@ class Shell(cmd.Cmd):
         pass
 
     def do_on(self, arg):
-        """on SECONDS [ANGLE] : move the servo (to ANGLE 0-180 if given), hold SECONDS, then back to rest"""
+        """on SECONDS [ANGLE] : move the servo (to ANGLE 0-180 if given), hold SECONDS, then back to where it was"""
         parts = arg.split()
         if not 1 <= len(parts) <= 2:
             print("  usage: on SECONDS [ANGLE]")
@@ -87,7 +87,7 @@ class Shell(cmd.Cmd):
         if s.running:
             print(f"  motor RUNNING at {s.angle}°, {s.remaining_s:.1f} s left")
         else:
-            print(f"  motor STOPPED (resting at {s.angle}°)")
+            print(f"  motor STOPPED (servo at {s.angle}°)")
 
     def do_rain(self, arg):
         """rain : read the rain sensor once"""

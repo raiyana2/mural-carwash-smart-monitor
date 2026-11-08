@@ -20,7 +20,7 @@ def on_change(state: ControllerState) -> None:
     if state.motor_running:
         motor = f"servo at {state.motor_angle}°, {state.motor_remaining_s:4.1f}s left"
     else:
-        motor = f"servo resting at {state.motor_angle}°"
+        motor = f"servo at {state.motor_angle}° (idle)"
     rain = (f"{state.rain.wet_percent:5.1f}% wet {'RAINING' if state.rain.raining else 'dry'}"
             if state.rain else "rain: -")
     print(f"{motor:32} | {rain}")
