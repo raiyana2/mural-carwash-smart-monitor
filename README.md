@@ -1,15 +1,20 @@
-# mural-carwash-smart-monitor
+# Mural Car Wash Smart Monitor
 
-A Raspberry Pi controls an ESP32 over a USB cable. The ESP32 drives a positional servo and reads a rain sensor.
+Offline Raspberry Pi + ESP32 prototype for monitoring and demonstrating an 11-bay self-serve car wash.
 
 ```
-Raspberry Pi (pi/)  ──USB serial──>  ESP32 (src/, PlatformIO)  ──>  servo + rain sensor
+Browser dashboard ──HTTP──> Raspberry Pi (pi/web_app.py) ──USB serial──> ESP32 (src/, PlatformIO) ──> servo + rain sensor
 ```
+
+- Bay 1 is the real ESP32 test bay: a positional servo and a rain sensor, reached through the `Esp32Link` USB serial client.
+- Bays 2–11 are explicitly labelled local simulator bays.
+- FastAPI serves the local operations dashboard; SQLite stores bay settings, pricing, sessions, and fault history.
+- Payments and multi-bay data are simulated. The application does not connect to a real payment system.
 
 | Folder | What's in it |
 |---|---|
-| `src/main.cpp`, `include/config.h`, `platformio.ini` | ESP32 firmware (PlatformIO project) |
-| `pi/` | Raspberry Pi code: `esp32_link.py`, the UI `controller.py`, the interactive `main.py`. See [`pi/README.md`](pi/README.md). |
+| `src/main.cpp`, `include/config.h`, `platformio.ini` | ESP32 firmware (PlatformIO project), documented below |
+| `pi/` | Raspberry Pi code: the web dashboard (`web_app.py`, `database.py`, `static/`), the serial client `esp32_link.py`, and command-line tools. See [Pi setup, launch, architecture, and simulator instructions](./pi/README.md). |
 
 ## Firmware
 
