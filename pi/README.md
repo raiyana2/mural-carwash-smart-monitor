@@ -1,6 +1,6 @@
 # Raspberry Pi side
 
-This is Python code that controls the ESP32 (running `../esp32/motor_rain_controller`) over the USB cable.
+This is Python code that controls the ESP32 (running the firmware in `../src/`, see the [main README](../README.md)) over the USB cable.
 
 | File | What it is |
 |---|---|
@@ -45,9 +45,9 @@ esp32> watch 2
   ...
 ```
 
-Commands: `on SECONDS [ANGLE]`, `off`, `status`, `rain`, `watch [SECONDS]`, `ping`, `help`, `quit`.
+Commands: `angle DEGREES`, `on SECONDS [ANGLE]`, `off`, `status`, `rain`, `watch [SECONDS]`, `ping`, `help`, `quit`.
 
-`on` moves the servo to ANGLE (0–180; default set by `SERVO_ACTIVE_ANGLE` in the firmware), holds it for SECONDS, then the ESP32 returns it to its rest angle.
+`angle` moves the servo and leaves it there. `on` is a timed hold: it moves the servo to ANGLE (0–180; default set by `SERVO_ACTIVE_ANGLE` in the firmware), holds it for SECONDS, then the ESP32 returns it to its rest angle. `angle` is refused while a timed hold is running.
 
 ## In your own code
 
@@ -55,10 +55,12 @@ Commands: `on SECONDS [ANGLE]`, `off`, `status`, `rain`, `watch [SECONDS]`, `pin
 from esp32_link import Esp32Link, Esp32Error
 
 with Esp32Link() as esp:                 # or Esp32Link("COM5")
-    esp.motor_on(5)                      # -> MotorStatus(running=True, remaining_s=5.0, angle=180)
+    esp.servo_set(90)                    # move and stay -> MotorStatus(running=False, remaining_s=0, angle=90)
+    esp.motor_on(5)                      # timed hold -> MotorStatus(running=True, remaining_s=5.0, angle=180)
     # esp.motor_on(5, angle=90)          # specific angle
     esp.motor_status()                   # ask the ESP32
     esp.motor_running                    # last known state, no request sent
+    esp.angle                            # last known angle, no request sent
     esp.wait_until_motor_stops(timeout=10)
     esp.motor_off()
     esp.read_rain()                      # -> RainReading(raw=1830, wet_percent=55.3, raining=True)
@@ -95,6 +97,7 @@ ctl = Controller()                      # or Controller(port="COM5", rain_interv
 ctl.subscribe(on_change)                # on_change(state) is called on every change
 ctl.start()                             # connects in the background, returns immediately
 
+ctl.set_angle(45)                       # Angle slider  -> ActionResult(ok=True, message="Servo to 45°")
 ctl.start_motor(5, angle=90)            # Start button  -> ActionResult(ok=True, message="Servo to 90° for 5 s")
 ctl.stop_motor()                        # Stop button
 ctl.refresh()                           # Refresh button (reads rain + status now)

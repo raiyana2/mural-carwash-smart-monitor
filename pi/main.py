@@ -5,9 +5,10 @@
     python main.py --port /dev/ttyUSB0
 
 Then type commands at the  esp32>  prompt:
-    on 5        move the servo to its "on" angle, hold 5 seconds, then back to rest
+    angle 90    move the servo to 90 degrees and leave it there
+    on 5        timed hold: servo to its "on" angle, hold 5 seconds, then back to rest
     on 5 90     same, but to 90 degrees
-    off         back to rest now
+    off         end a timed hold now (back to rest)
     status      is it holding? how long is left? what angle?
     rain        read the rain sensor once
     watch 2     read the rain sensor every 2 seconds (Ctrl+C to stop)
@@ -66,6 +67,14 @@ class Shell(cmd.Cmd):
         angle = int(parts[1]) if len(parts) == 2 else None
         s = self.esp.motor_on(float(parts[0]), angle)
         print(f"  servo at {s.angle}° for {s.remaining_s:.1f} s")
+
+    def do_angle(self, arg):
+        """angle DEGREES : move the servo to DEGREES (0-180) and leave it there"""
+        if not arg.strip():
+            print("  usage: angle DEGREES")
+            return
+        s = self.esp.servo_set(int(arg))
+        print(f"  servo at {s.angle}°")
 
     def do_off(self, arg):
         """off : stop the motor now"""

@@ -3,7 +3,8 @@
     from esp32_link import Esp32Link
 
     with Esp32Link() as esp:            # finds the ESP32's USB port automatically
-        esp.motor_on(5)                  # servo to its "on" angle for 5 seconds
+        esp.servo_set(90)                # move to 90° and stay there
+        esp.motor_on(5)                  # timed hold: servo to its "on" angle for 5 s, then back to rest
         esp.motor_on(5, angle=90)        # ...or to a specific angle (after the first one ends)
         print(esp.motor_status())        # MotorStatus(running=True, remaining_s=4.9, angle=180)
         esp.wait_until_motor_stops()
@@ -86,6 +87,7 @@ class Esp32Link:
         self._motor_running = False
         self._motor_stopped = threading.Event()
         self._motor_stopped.set()
+        self._angle: int | None = None
 
     # ------------------------------------------------------------------
     # connect / disconnect
@@ -160,6 +162,22 @@ class Esp32Link:
     def motor_status(self) -> MotorStatus:
         return self._motor_reply(self._request("motor_status"))
 
+    def servo_set(self, angle: int) -> MotorStatus:
+        """Move the servo to `angle` (0-180) and leave it there (no timer).
+        The ESP32 refuses this while a timed hold (motor_on) is running."""
+        if not 0 <= angle <= 180:
+            raise ValueError("angle must be 0-180")
+        return self._motor_reply(self._request("servo_set", angle=int(angle)))
+
+    def servo_status(self) -> MotorStatus:
+        """Same information as motor_status(): angle, and whether a timed hold is running."""
+        return self._motor_reply(self._request("servo_status"))
+
+    @property
+    def angle(self) -> int | None:
+        """Last known servo angle (kept current by replies and events, no request sent)."""
+        return self._angle
+
     def read_rain(self) -> RainReading:
         d = self._request("rain")
         return RainReading(raw=d["raw"], wet_percent=d["wet_percent"], raining=d["raining"])
@@ -193,6 +211,8 @@ class Esp32Link:
             running=data["running"], remaining_s=data["remaining_s"], angle=data.get("angle")
         )
         self._set_motor_running(status.running)
+        if status.angle is not None:
+            self._angle = status.angle
         return status
 
     def _request(self, cmd: str, timeout: float | None = None, **fields: Any) -> dict:
@@ -247,6 +267,8 @@ class Esp32Link:
             return
 
         if msg.get("type") == "event":
+            if msg.get("angle") is not None:      # "servo" and "motor" events carry the angle
+                self._angle = msg["angle"]
             running = None
             if msg.get("event") == "motor":
                 running = bool(msg.get("running"))

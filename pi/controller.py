@@ -16,6 +16,7 @@ never to Esp32Link directly. The controller:
     ctl.start()                              # connects in the background
 
     result = ctl.start_motor(5, angle=90)    # -> ActionResult(ok=True, message="...")
+    ctl.set_angle(45)                        # move and stay (no timer)
     ctl.state                                 # -> ControllerState(...) snapshot
     ctl.stop()
 
@@ -179,6 +180,14 @@ class Controller:
             return f"Servo to {s.angle}° for {seconds:g} s"
         return self._action(do)
 
+    def set_angle(self, angle: int) -> ActionResult:
+        """Move the servo to `angle` and leave it there (no timer)."""
+        def do(link: Esp32Link) -> str:
+            s = link.servo_set(angle)
+            self._apply_motor(s.running, s.angle, s.remaining_s)
+            return f"Servo to {s.angle}°"
+        return self._action(do)
+
     def stop_motor(self) -> ActionResult:
         def do(link: Esp32Link) -> str:
             s = link.motor_off()
@@ -311,6 +320,16 @@ class Controller:
                 return
             why = {"timer": "time is up", "stopped": "stopped"}.get(evt.get("reason"), evt.get("reason"))
             self._add_log(f"Servo back to rest ({why})")
+        elif evt.get("event") == "servo":
+            # Sent on every angle change: manual servo_set moves and timed holds.
+            running = bool(evt.get("running"))
+            with self._lock:
+                self._motor_angle = evt.get("angle")
+                self._motor_running = running
+                if not running:
+                    self._motor_ends_at = 0.0
+            if running:
+                return  # start of a timed hold: the start_motor reply sends the update
         elif evt.get("event") == "ready":
             with self._lock:
                 self._motor_running = False

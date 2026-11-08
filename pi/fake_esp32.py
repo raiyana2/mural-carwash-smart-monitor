@@ -4,8 +4,9 @@
     -> prints a port like /dev/pts/3
     python main.py --port /dev/pts/3      (in another terminal)
 
-It speaks the same protocol as esp32/motor_rain_controller, including the motor
-timer. The rain value drifts slowly so 'watch' has something to show.
+It speaks the same protocol as the firmware in src/main.cpp: servo_set /
+servo_status, timed holds (motor_on / motor_off / motor_status), rain and ping,
+with the same events. The rain value drifts slowly so 'watch' has something to show.
 """
 import json
 import math
@@ -22,21 +23,34 @@ tty.setraw(slave)
 print(f"fake ESP32 listening on {os.ttyname(slave)}", flush=True)
 
 booted = time.monotonic()
-motor = {"running": False, "until": 0.0, "angle": REST_ANGLE}
+servo = {"angle": REST_ANGLE, "running": False, "until": 0.0}   # running = timed hold active
 
 
 def send(obj):
     os.write(master, (json.dumps(obj) + "\n").encode())
 
 
+def set_angle(angle):
+    servo["angle"] = max(0, min(180, angle))
+    send({"type": "event", "event": "servo", "angle": servo["angle"], "running": servo["running"]})
+
+
 def motor_event(reason):
-    send({"type": "event", "event": "motor", "running": motor["running"],
-          "reason": reason, "angle": motor["angle"]})
+    send({"type": "event", "event": "motor", "running": servo["running"],
+          "reason": reason, "angle": servo["angle"]})
+
+
+def hold_stop(reason):
+    if not servo["running"]:
+        return
+    servo["running"] = False
+    set_angle(REST_ANGLE)
+    motor_event(reason)
 
 
 def status():
-    left = max(0.0, motor["until"] - time.monotonic()) if motor["running"] else 0.0
-    return {"running": motor["running"], "remaining_s": round(left, 3), "angle": motor["angle"]}
+    left = max(0.0, servo["until"] - time.monotonic()) if servo["running"] else 0.0
+    return {"angle": servo["angle"], "running": servo["running"], "remaining_s": round(left, 3)}
 
 
 def rain():
@@ -48,26 +62,33 @@ def rain():
 
 def handle(req):
     cmd, ok, err, data = req.get("cmd"), True, None, {}
-    if cmd == "motor_on":
+    if cmd == "servo_set":
+        angle = req.get("angle", -1)
+        if not isinstance(angle, int) or not 0 <= angle <= 180:
+            ok, err = False, "angle must be between 0 and 180"
+        elif servo["running"]:
+            ok, err = False, "timed hold running; send motor_off first"
+        else:
+            set_angle(angle)
+        data = status()
+    elif cmd in ("servo_status", "motor_status"):
+        data = status()
+    elif cmd == "motor_on":
         s = float(req.get("seconds", 0))
         angle = int(req.get("angle", ACTIVE_ANGLE))
         if s <= 0 or s > MAX_RUN_SECONDS:
             ok, err = False, f"seconds must be > 0 and <= {MAX_RUN_SECONDS}"
         elif not 0 <= angle <= 180:
-            ok, err = False, "angle must be 0-180"
-        elif motor["running"]:
+            ok, err = False, "angle must be between 0 and 180"
+        elif servo["running"]:
             ok, err = False, "motor already running"
         else:
-            motor.update(running=True, until=time.monotonic() + s, angle=angle)
+            servo.update(running=True, until=time.monotonic() + s)
+            set_angle(angle)
             motor_event("started")
         data = status()
     elif cmd == "motor_off":
-        was = motor["running"]
-        motor.update(running=False, angle=REST_ANGLE)
-        if was:
-            motor_event("stopped")
-        data = status()
-    elif cmd == "motor_status":
+        hold_stop("stopped")
         data = status()
     elif cmd == "rain":
         data = rain()
@@ -79,11 +100,11 @@ def handle(req):
 
 
 send({"type": "event", "event": "ready"})
+set_angle(REST_ANGLE)
 buf = b""
 while True:
-    if motor["running"] and time.monotonic() >= motor["until"]:
-        motor.update(running=False, angle=REST_ANGLE)
-        motor_event("timer")
+    if servo["running"] and time.monotonic() >= servo["until"]:
+        hold_stop("timer")
     r, _, _ = select.select([master], [], [], 0.05)
     if not r:
         continue
