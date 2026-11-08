@@ -1,37 +1,42 @@
 /*
   motor_rain_controller.ino: ESP32 firmware controlled by a Raspberry Pi over USB.
+  Drives a POSITIONAL servo and reads a rain sensor.
 
-  The Pi sends one JSON request per line; the ESP32 answers each one with a
-  reply carrying the same "id". The ESP32 also sends "events" on its own when
-  something changes (for example the motor's timer runs out).
+  "Motor on" for a positional servo means: move to an angle, hold it for N
+  seconds, then go back to the rest angle. The protocol keeps the name "motor"
+  so the Pi code doesn't change.
 
-  Requests (Pi -> ESP32):
-    {"id":1, "cmd":"motor_on", "seconds":5}   run the motor for 5 seconds
-    {"id":2, "cmd":"motor_off"}                stop the motor now
-    {"id":3, "cmd":"motor_status"}             is the motor running?
-    {"id":4, "cmd":"rain"}                     read the rain sensor
-    {"id":5, "cmd":"ping"}                     check the ESP32 is alive
+  Requests (Pi -> ESP32), one JSON object per line:
+    {"id":1, "cmd":"motor_on", "seconds":5}               move to SERVO_ACTIVE_ANGLE, hold 5 s
+    {"id":2, "cmd":"motor_on", "seconds":5, "angle":90}   move to 90°, hold 5 s
+    {"id":3, "cmd":"motor_off"}                            go back to rest now
+    {"id":4, "cmd":"motor_status"}                         running? time left? angle?
+    {"id":5, "cmd":"rain"}                                 read the rain sensor
+    {"id":6, "cmd":"ping"}                                 check the ESP32 is alive
 
   Replies (ESP32 -> Pi):
-    {"type":"reply", "id":1, "ok":true,  "error":null, "data":{"running":true, "remaining_s":5.0}}
-    {"type":"reply", "id":4, "ok":true,  "error":null, "data":{"raw":1830, "wet_percent":55.3, "raining":true}}
-    {"type":"reply", "id":9, "ok":false, "error":"motor already running", "data":{...}}
+    {"type":"reply","id":1,"ok":true,"error":null,"data":{"running":true,"remaining_s":5.0,"angle":180}}
+    {"type":"reply","id":5,"ok":true,"error":null,"data":{"raw":1830,"wet_percent":55.3,"raining":true}}
 
   Events (ESP32 -> Pi, unprompted):
-    {"type":"event", "event":"ready"}                                    after boot
-    {"type":"event", "event":"motor", "running":true,  "reason":"started"}
-    {"type":"event", "event":"motor", "running":false, "reason":"timer"}     (or "stopped")
+    {"type":"event","event":"ready"}
+    {"type":"event","event":"motor","running":true, "reason":"started","angle":180}
+    {"type":"event","event":"motor","running":false,"reason":"timer","angle":0}   (or "stopped")
 
-  Library: ArduinoJson v7 (Benoit Blanchon). Board: "ESP32 Dev Module".
-  Pins are set in config.h.
+  Libraries: ArduinoJson v7 (Benoit Blanchon), ESP32Servo (Kevin Harrington).
+  Board: "ESP32 Dev Module". Pins and angles are set in config.h.
 */
 #include <ArduinoJson.h>
+#include <ESP32Servo.h>
 #include "config.h"
 
 // ---------------- state ----------------
-bool motorRunning = false;
-unsigned long motorStartedAt = 0;   // millis() when the motor was turned on
-unsigned long motorRunMs = 0;       // how long it should run for
+Servo servo;
+int servoAngle = SERVO_REST_ANGLE;  // last angle we told the servo to go to
+
+bool motorRunning = false;          // true while holding the active angle
+unsigned long motorStartedAt = 0;   // millis() when the hold started
+unsigned long motorRunMs = 0;       // how long to hold
 
 char line[256];                     // incoming line from the Pi
 size_t lineLen = 0;
@@ -42,10 +47,12 @@ void sendJson(JsonDocument& doc) {
   Serial.print('\n');
 }
 
-// ---------------- motor ----------------
-void writeMotorPin(bool on) {
-  // Turns "on/off" into the right voltage for active-high or active-low modules.
-  digitalWrite(MOTOR_PIN, (on == MOTOR_ACTIVE_HIGH) ? HIGH : LOW);
+// ---------------- servo ----------------
+void moveServo(int angle) {
+  // servo.write() sends the 50 Hz pulses for this angle; the servo then
+  // turns there at its own speed and holds the position.
+  servoAngle = angle;
+  servo.write(angle);
 }
 
 unsigned long motorRemainingMs() {
@@ -60,28 +67,30 @@ void sendMotorEvent(const char* reason) {
   d["event"] = "motor";
   d["running"] = motorRunning;
   d["reason"] = reason;
+  d["angle"] = servoAngle;
   sendJson(d);
 }
 
-void motorStart(float seconds) {
+void motorStart(float seconds, int angle) {
   motorStartedAt = millis();
   motorRunMs = (unsigned long)(seconds * 1000.0f);
   motorRunning = true;
-  writeMotorPin(true);
+  moveServo(angle);
   sendMotorEvent("started");
 }
 
 void motorStop(const char* reason) {
   bool wasRunning = motorRunning;
-  writeMotorPin(false);
   motorRunning = false;
   motorRunMs = 0;
+  moveServo(SERVO_REST_ANGLE);
   if (wasRunning) sendMotorEvent(reason);
 }
 
 void fillMotorStatus(JsonObject o) {
   o["running"] = motorRunning;
   o["remaining_s"] = motorRemainingMs() / 1000.0;
+  o["angle"] = servoAngle;
 }
 
 // ---------------- rain sensor ----------------
@@ -118,14 +127,18 @@ void handleRequest(const char* text, size_t len) {
 
   if (cmd == "motor_on") {
     float seconds = req["seconds"] | 0.0f;
+    int angle = req["angle"] | SERVO_ACTIVE_ANGLE;   // optional; default from config.h
     if (seconds <= 0 || seconds > MAX_RUN_SECONDS) {
       ok = false;
       error = String("seconds must be > 0 and <= ") + MAX_RUN_SECONDS;
+    } else if (angle < 0 || angle > 180) {
+      ok = false;
+      error = "angle must be 0-180";
     } else if (motorRunning) {
       ok = false;
       error = "motor already running";
     } else {
-      motorStart(seconds);
+      motorStart(seconds, angle);
     }
     fillMotorStatus(data);
 
@@ -168,16 +181,16 @@ void readSerial() {
 
 // ---------------- main ----------------
 void setup() {
-  writeMotorPin(false);          // set the "off" level before the pin becomes an output
-  pinMode(MOTOR_PIN, OUTPUT);
-  writeMotorPin(false);
+  Serial.begin(SERIAL_BAUD);
+
+  servo.setPeriodHertz(50);                          // standard servo signal: 50 pulses per second
+  servo.attach(SERVO_PIN, SERVO_MIN_US, SERVO_MAX_US);
+  moveServo(SERVO_REST_ANGLE);                       // note: the servo moves to rest at power-up
 
   pinMode(RAIN_DIGITAL_PIN, INPUT);
   analogReadResolution(12);
 
-  Serial.begin(SERIAL_BAUD);
   delay(100);
-
   JsonDocument ready;
   ready["type"] = "event";
   ready["event"] = "ready";
@@ -187,8 +200,8 @@ void setup() {
 void loop() {
   readSerial();
 
-  // Timer: stop the motor when its time is up. This runs on the ESP32 itself,
-  // so the motor still stops on time even if the Pi crashes or the cable is pulled.
+  // Timer: go back to rest when the hold time is up. This runs on the ESP32
+  // itself, so it still happens even if the Pi crashes or the cable is pulled.
   if (motorRunning && motorRemainingMs() == 0) {
     motorStop("timer");
   }

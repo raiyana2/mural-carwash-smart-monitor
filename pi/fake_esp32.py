@@ -15,13 +15,14 @@ import time
 import tty
 
 MAX_RUN_SECONDS = 300
+REST_ANGLE, ACTIVE_ANGLE = 0, 180
 
 master, slave = os.openpty()
 tty.setraw(slave)
 print(f"fake ESP32 listening on {os.ttyname(slave)}", flush=True)
 
 booted = time.monotonic()
-motor = {"running": False, "until": 0.0}
+motor = {"running": False, "until": 0.0, "angle": REST_ANGLE}
 
 
 def send(obj):
@@ -29,12 +30,13 @@ def send(obj):
 
 
 def motor_event(reason):
-    send({"type": "event", "event": "motor", "running": motor["running"], "reason": reason})
+    send({"type": "event", "event": "motor", "running": motor["running"],
+          "reason": reason, "angle": motor["angle"]})
 
 
 def status():
     left = max(0.0, motor["until"] - time.monotonic()) if motor["running"] else 0.0
-    return {"running": motor["running"], "remaining_s": round(left, 3)}
+    return {"running": motor["running"], "remaining_s": round(left, 3), "angle": motor["angle"]}
 
 
 def rain():
@@ -48,17 +50,21 @@ def handle(req):
     cmd, ok, err, data = req.get("cmd"), True, None, {}
     if cmd == "motor_on":
         s = float(req.get("seconds", 0))
+        angle = int(req.get("angle", ACTIVE_ANGLE))
         if s <= 0 or s > MAX_RUN_SECONDS:
             ok, err = False, f"seconds must be > 0 and <= {MAX_RUN_SECONDS}"
+        elif not 0 <= angle <= 180:
+            ok, err = False, "angle must be 0-180"
         elif motor["running"]:
             ok, err = False, "motor already running"
         else:
-            motor.update(running=True, until=time.monotonic() + s)
+            motor.update(running=True, until=time.monotonic() + s, angle=angle)
             motor_event("started")
         data = status()
     elif cmd == "motor_off":
-        if motor["running"]:
-            motor["running"] = False
+        was = motor["running"]
+        motor.update(running=False, angle=REST_ANGLE)
+        if was:
             motor_event("stopped")
         data = status()
     elif cmd == "motor_status":
@@ -76,7 +82,7 @@ send({"type": "event", "event": "ready"})
 buf = b""
 while True:
     if motor["running"] and time.monotonic() >= motor["until"]:
-        motor["running"] = False
+        motor.update(running=False, angle=REST_ANGLE)
         motor_event("timer")
     r, _, _ = select.select([master], [], [], 0.05)
     if not r:
