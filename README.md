@@ -1,1 +1,0 @@
-# mural-carwash-smart-monitor
