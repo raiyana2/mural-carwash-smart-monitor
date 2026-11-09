@@ -6,6 +6,36 @@ Offline prototype that centralizes the controls of an 11-bay self-serve car wash
 Browser dashboard ──HTTP──> local computer (pi/carwash) ──USB serial──> ESP32 (firmware/motor_rain_controller) ──> servo, sensors, button, LCD
 ```
 
+# How to run
+
+You need: Python 3.9+, and for the real hardware an ESP32 V2 wired up as described in the README, plus VS Code with the PlatformIO extension. Without the ESP32 the dashboard still runs: Bays 2–11 are simulated and Bay 1 shows as offline.
+
+1. Set up (first time only)
+powershell
+git clone https://github.com/raiyana2/mural-carwash-smart-monitor.git
+cd mural-carwash-smart-monitor\main
+py -m venv .venv
+.venv\Scripts\activate
+python -m pip install -r requirements.txt
+
+On Mac or Linux, use python3 and source .venv/bin/activate.
+
+2. Upload the firmware (first time, and after firmware changes)
+
+Plug in the ESP32, open the repository folder in VS Code, and click PlatformIO’s Upload (→). The LCD shows “ESP32 Ready” when it’s done.
+
+3. Start the dashboard
+powershell
+cd mural-carwash-smart-monitor\main
+.venv\Scripts\activate
+python -m uvicorn web_app:app --host 127.0.0.1 --port 8000
+
+Open http://127.0.0.1:8000. Press Ctrl+C to stop it.
+
+4. Connect the ESP32
+
+It usually connects by itself; the sidebar shows ESP32 · Connected. If it doesn’t, go to Maintenance, press Scan ports, then Use next to the board, then Connect. Close any serial monitor first, since only one program can use the port.
+
 Bay 1's parts stand in for real car wash equipment:
 
 | Part on the ESP32 | Stands for |
