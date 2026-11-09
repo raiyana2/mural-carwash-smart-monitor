@@ -28,7 +28,7 @@ import tty
 MAX_RUN_SECONDS = 3600
 REST_ANGLE, ACTIVE_ANGLE = 0, 180
 LCD_COLS = 16
-FEATURES = ["motor", "rain", "distance", "button", "lcd"]
+FEATURES = ["motor", "extend", "rain", "distance", "button", "lcd"]
 
 master, slave = os.openpty()
 tty.setraw(slave)
@@ -130,6 +130,19 @@ def handle(req):
             set_angle(angle)
             motor_event("started")
         data = status()
+    elif cmd == "motor_add":
+        s = float(req.get("seconds", 0))
+        left = max(0.0, servo["until"] - time.monotonic())
+        if not servo["running"]:
+            ok, err = False, "no run in progress"
+        elif s <= 0 or left + s > MAX_RUN_SECONDS:
+            ok, err = False, f"time left must stay <= {MAX_RUN_SECONDS} s"
+        else:
+            servo["until"] += s
+            if req.get("label"):
+                lcd["run_label"] = str(req["label"])[:LCD_COLS]
+            motor_event("extended")
+        data = status()
     elif cmd == "motor_off":
         hold_stop("stopped")
         data = status()
@@ -153,7 +166,7 @@ def handle(req):
         data = {"backlight": lcd["backlight"]}
     elif cmd == "ping":
         data = {"uptime_s": round(time.monotonic() - booted, 1), "firmware": "motor_rain_controller",
-                "version": 2, "features": FEATURES}
+                "version": 3, "features": FEATURES}
     elif cmd == "_press_button":                         # for tests: acts like a press of the real button
         press_button()
     else:

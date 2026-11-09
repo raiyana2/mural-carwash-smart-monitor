@@ -39,9 +39,11 @@ RETRY_SECONDS_DEFAULT = 10
 # ---------------- Bay 1 sensors and button ----------------
 DISTANCE_POLL_SECONDS = 1        # how often the dashboard reads the ultrasonic sensor
 DISTANCE_STALE_SECONDS = 10      # an older distance reading counts as unknown
-VEHICLE_PRESENT_CM = 50          # something closer than this counts as a car in the bay
-CAR_CONFIRM_POLLS = 2            # seen this many readings in a row = one car counted
-BUTTON_RUN_SECONDS = 60          # a press of Bay 1's button buys one minute ($1.00)
+VEHICLE_PRESENT_CM = 30          # something this close or closer is a car in the bay
+CAR_CONFIRM_POLLS = 2            # during a wash, a car this many readings in a row = one car counted
+END_WASH_WHEN_CAR_LEAVES = True  # end the wash once the counted car is further than VEHICLE_PRESENT_CM
+CAR_LEFT_POLLS = 2               # ...for this many readings in a row (ignores one bad reading)
+BUTTON_RUN_SECONDS = 10          # each press of Bay 1's button buys this many seconds
 
 # ---------------- water flow (the rain sensor stands in for a flow meter) ----------------
 FLOW_FULL_SCALE_LPM = 10.0       # rain sensor fully wet = 10 litres per minute

@@ -23,6 +23,8 @@ let polling = false;
 let pollCount = 0;
 const washMinutes = {};   // bay number -> minutes typed into its box
 const busyBays = new Set();
+const expandedBays = new Set();   // Bay Manager cards opened up to show the bay's details
+const bayExtras = {};             // bay number -> {detail, today} for expanded cards
 
 // ---------------------------------------------------------------- helpers
 function escapeHTML(value) {
@@ -204,7 +206,8 @@ function buttonLine(bay) {
   if (bay.source !== "hardware" || !bay.connected || !hasFeature(bay, "button")) return "";
   const seconds = hw.button_run_seconds;
   const last = hw.last_button_at ? ` · last press ${timeOnly(hw.last_button_at)}: ${hw.last_button_result || "…"}` : "";
-  return `Button · buys ${Math.round(seconds / 60)} min (${money(priceFor(bay, seconds))})${last}`;
+  const length = seconds % 60 === 0 ? `${seconds / 60} min` : seconds < 60 ? `${seconds} s` : duration(seconds);
+  return `Button · each press buys ${length} (first press ${money(priceFor(bay, seconds))}): starts a wash or adds to it${last}`;
 }
 
 // What Bay 1's LCD is showing (the same text the server sends it).
@@ -298,6 +301,7 @@ async function poll() {
     if (page === "maintenance" && pollCount % 3 === 0) faultHistory = await api("/api/faults");
     if (page === "maintenance" && pollCount % 5 === 0) equipment = await api("/api/maintenance");
     if (page === "analytics" && pollCount % 30 === 0) await loadReport(false);
+    if (page === "bays" && expandedBays.size && pollCount % 5 === 0) await loadBayExtras();
     updatePage();
   } catch {
     // The next poll tries again; a stopped server shows up as stale numbers.
@@ -411,6 +415,7 @@ function bayCard(bay) {
   const minutes = Math.min(washMinutes[n] || DEFAULT_WASH_MINUTES, maxWashMinutes(bay));
   const hardware = bay.source === "hardware";
   return `<article class="bay-card ${hardware ? "bay-card-physical" : ""}" id="bay-card-${n}" data-card="${n}">
+    <div class="bay-card-main">
     <header class="bay-card-head">
       <div><p class="eyebrow">BAY ${pad2(n)}</p><h2>${escapeHTML(bay.label)}</h2></div>
       <div class="bay-card-tags">${sourceTag(bay.source)}<span data-field="status"></span></div>
@@ -426,10 +431,80 @@ function bayCard(bay) {
     <form class="run-form" data-form="run" data-bay="${n}">
       <label>Wash time<span class="input-suffix"><input name="minutes" type="number" inputmode="numeric" min="1" max="${maxWashMinutes(bay)}" step="1" value="${minutes}" required aria-label="${escapeHTML(bay.label)} wash time in minutes"><span>min</span><b class="price-chip" data-field="price"></b></span></label>
       <button type="submit" class="button button-primary" data-field="run">Start wash</button>
+      <button type="button" class="button button-outline" data-action="add-minute" data-bay="${n}" data-field="add" title="Add 1 minute to this wash">+1 min</button>
       <button type="button" class="button button-outline" data-action="stop" data-bay="${n}" data-field="stop">Stop wash</button>
     </form>
     <p class="bay-card-note" data-field="note"></p>
+    <button type="button" class="expand-button" data-action="expand" data-bay="${n}" data-field="expand" aria-expanded="false" aria-controls="bay-extra-${n}"></button>
+    </div>
+    <section class="bay-card-extra" id="bay-extra-${n}" data-field="extra" aria-label="${escapeHTML(bay.label)} details" hidden></section>
   </article>`;
+}
+
+// ---------------------------------------------------------------- expanded bay details
+// The details come from three requests shared by every open card: the bay itself
+// (recent washes and faults), equipment health, and today's report.
+async function loadBayExtras(numbers = [...expandedBays]) {
+  if (!numbers.length) return;
+  const [maintenance, today, ...details] = await Promise.all([
+    api("/api/maintenance"), api("/api/reports?days=1"), ...numbers.map(n => api(`/api/bays/${n}`))]);
+  equipment = maintenance;
+  numbers.forEach((n, i) => {
+    bayExtras[n] = { detail: details[i], today: today.by_bay.find(b => b.bay_number === n) };
+  });
+}
+
+function sessionLength(s, now) {
+  const end = s.ended_at || now;
+  return Math.max(0, Math.min(Math.round(end - s.started_at), s.granted_seconds));
+}
+
+function sessionOutcome(s, ran) {
+  if (s.status === "active") return "In progress";
+  if (s.status === "completed") return ran < s.granted_seconds - 2 ? "Stopped early" : "Finished";
+  return s.status.charAt(0).toUpperCase() + s.status.slice(1).replaceAll("_", " ");
+}
+
+function bayExtraHTML(bay) {
+  const extra = bayExtras[bay.bay_number];
+  if (!extra) return `<p class="panel-copy">Loading ${escapeHTML(bay.label)}'s details…</p>`;
+  const { detail, today } = extra;
+  const now = Date.now() / 1000;
+  const health = equipment && equipment.bays.find(b => b.bay_number === bay.bay_number);
+  const t = today || { washes: 0, revenue_cents: 0, cars: 0, avg_sale_cents: 0, seconds_sold: 0 };
+  const perMinute = bay.additional_price_per_minute_cents;
+  const sessions = detail.sessions.slice(0, 8);
+  const faults = detail.faults.slice(0, 5);
+  return `
+    <div class="extra-section">
+      <h3>Today</h3>
+      <div class="extra-stats">
+        <div><span>Washes</span><strong>${count(t.washes)}</strong></div>
+        <div><span>Revenue</span><strong>${money(t.revenue_cents)}</strong></div>
+        <div><span>Cars</span><strong>${count(t.cars)}</strong></div>
+        <div><span>Minutes sold</span><strong>${count(Math.round(t.seconds_sold / 60))}</strong></div>
+      </div>
+      <p class="extra-note">Price ${bay.base_price_cents === perMinute && bay.included_seconds === 60 ? `${money(perMinute)} a minute` : `${money(bay.base_price_cents)} for ${Math.round(bay.included_seconds / 60)} min, then ${money(perMinute)} a minute`} · up to ${maxWashMinutes(bay)} minutes${bay.source === "simulator" ? " · simulated data" : ""}</p>
+    </div>
+    ${health ? `<div class="extra-section">
+      <h3>Equipment health</h3>
+      <div class="extra-equipment">${health.equipment.map(item => equipmentCell(health, item)).join("")}</div>
+    </div>` : ""}
+    <div class="extra-section">
+      <h3>Recent washes</h3>
+      ${sessions.length ? `<div class="data-table-wrap"><table class="data-table extra-table">
+        <thead><tr><th>Started</th><th>Length</th><th>Paid</th><th>How it ended</th></tr></thead>
+        <tbody>${sessions.map(s => {
+          const ran = sessionLength(s, now);
+          const paidFor = ran < s.granted_seconds - 2 && s.status !== "active" ? ` of ${duration(s.granted_seconds)}` : "";
+          const length = s.status === "active" ? `${duration(s.granted_seconds)} paid` : `${duration(ran)}${paidFor}`;
+          return `<tr><td>${escapeHTML(new Date(s.started_at * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }))}</td><td>${length}</td><td>${money(s.price_cents)}</td><td>${sessionOutcome(s, ran)}</td></tr>`;
+        }).join("")}</tbody></table></div>` : `<p class="panel-copy">No washes yet.</p>`}
+    </div>
+    <div class="extra-section">
+      <h3>Faults</h3>
+      ${faults.length ? faults.map(f => faultRow({ ...f, label: bay.label })).join("") : `<p class="panel-copy">No faults recorded for this bay.</p>`}
+    </div>`;
 }
 
 function mountBays(data, params) {
@@ -442,6 +517,7 @@ function mountBays(data, params) {
   const focus = params.get("bay");
   const card = focus && document.querySelector(`#bay-card-${CSS.escape(focus)}`);
   if (card) {
+    toggleBay(Number(focus), true);
     card.scrollIntoView({ block: "center", behavior: "smooth" });
     card.classList.add("card-focus");
     window.setTimeout(() => card.classList.remove("card-focus"), 1800);
@@ -456,7 +532,14 @@ function updateBays(data) {
     const running = isRunning(bay);
     const blocked = blockedReason(bay);
     const busy = busyBays.has(bay.bay_number);
-    card.className = `bay-card bay-card-${state} ${bay.source === "hardware" ? "bay-card-physical" : ""}`;
+    const expanded = expandedBays.has(bay.bay_number);
+    card.className = `bay-card bay-card-${state} ${bay.source === "hardware" ? "bay-card-physical" : ""} ${expanded ? "bay-card-expanded" : ""}`;
+    const expandButton = field(card, "expand");
+    expandButton.setAttribute("aria-expanded", String(expanded));
+    setText(expandButton, expanded ? "Hide details ↑" : "Show details ↓");
+    const extra = field(card, "extra");
+    extra.hidden = !expanded;
+    if (expanded) setHTML(extra, bayExtraHTML(bay));
     setHTML(field(card, "status"), statusTag(state));
     const title = headline(bay);
     const titleEl = field(card, "headline");
@@ -481,8 +564,19 @@ function updateBays(data) {
     setText(field(card, "price"), Number.isInteger(minutes) && minutes >= 1 ? money(priceFor(bay, minutes * 60)) : "");
     field(card, "run").disabled = Boolean(blocked) || running || busy;
     field(card, "stop").disabled = !running || busy || (bay.source === "hardware" && !bay.connected);
+    field(card, "add").disabled = !running || busy || Boolean(blocked)
+      || (bay.run_seconds != null && bay.run_seconds + 60 > bay.maximum_duration_seconds);
     let note = blocked || "";
-    if (!note && running && bay.source === "hardware") note = "Stop wash closes the valve right away.";
+    const hw = data.hardware;
+    if (!note && running && bay.source === "hardware") {
+      note = hw.end_wash_when_car_leaves && hasFeature(bay, "distance")
+        ? `Ends early once the car leaves (further than ${hw.car_present_cm} cm). Stop wash closes the valve right away.`
+        : "Stop wash closes the valve right away.";
+    }
+    if (!note && !running && bay.source === "hardware" && hw.last_car_left_at
+        && Date.now() / 1000 - hw.last_car_left_at < 120) {
+      note = `Last wash ended early at ${timeOnly(hw.last_car_left_at)}: the car left.`;
+    }
     const noteEl = field(card, "note");
     setText(noteEl, note);
     noteEl.classList.toggle("note-warning", Boolean(blocked));
@@ -774,6 +868,7 @@ async function refreshNow() {
   if (page === "maintenance") {
     [faultHistory, equipment] = await Promise.all([api("/api/faults"), api("/api/maintenance")]);
   }
+  if (page === "bays") await loadBayExtras();
   updatePage();
 }
 
@@ -794,6 +889,29 @@ async function startWash(form) {
   } finally {
     busyBays.delete(bayNumber);
     await refreshNow();
+  }
+}
+
+async function addMinute(bayNumber) {
+  const bay = latest.bays.find(b => b.bay_number === bayNumber);
+  busyBays.add(bayNumber);
+  updatePage();
+  try {
+    const detail = await api(`/api/bays/${bayNumber}/add`, { method: "POST", body: JSON.stringify({ seconds: 60 }) });
+    const total = detail.active_granted_seconds;
+    showNotice(`${bay.label}: added 1 minute. The wash is now ${Math.round(total / 60)} min (${money(priceFor(bay, total))}).`);
+  } finally {
+    busyBays.delete(bayNumber);
+    await refreshNow();
+  }
+}
+
+async function toggleBay(bayNumber, open = !expandedBays.has(bayNumber)) {
+  if (open) expandedBays.add(bayNumber); else expandedBays.delete(bayNumber);
+  updatePage();
+  if (open) {
+    await loadBayExtras([bayNumber]);
+    updatePage();
   }
 }
 
@@ -837,6 +955,10 @@ app.addEventListener("click", async event => {
       await render();
     } else if (action === "stop") {
       await stopWash(Number(button.dataset.bay));
+    } else if (action === "expand") {
+      await toggleBay(Number(button.dataset.bay));
+    } else if (action === "add-minute") {
+      await addMinute(Number(button.dataset.bay));
     } else if (action === "range") {
       reportDays = Number(button.dataset.days);
       app.querySelectorAll('[data-action="range"]').forEach(b => {

@@ -16,6 +16,10 @@ class SessionRequest(BaseModel):
     wash_mode: Optional[str] = None
 
 
+class AddTimeRequest(BaseModel):
+    seconds: int = Field(default=60, ge=1, le=MAX_MOTOR_SECONDS)
+
+
 class SettingsRequest(BaseModel):
     label: str = Field(min_length=1, max_length=40)
     enabled: bool

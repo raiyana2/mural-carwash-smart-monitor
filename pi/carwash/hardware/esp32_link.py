@@ -356,6 +356,16 @@ class Esp32Link:
             fields["label"] = str(label)[:16]
         return self._motor_reply(self._request("motor_on", **fields))
 
+    def motor_add(self, seconds: float, label: str | None = None) -> MotorStatus:
+        """Add `seconds` to the run in progress; the servo stays put. `label` replaces the
+        LCD's first line (e.g. the new price). Needs firmware with the "extend" feature."""
+        if seconds <= 0:
+            raise ValueError("seconds must be > 0")
+        fields = {"seconds": seconds}
+        if label:
+            fields["label"] = str(label)[:16]
+        return self._motor_reply(self._request("motor_add", **fields))
+
     def motor_off(self) -> MotorStatus:
         """End a timed run now (the servo turns back)."""
         return self._motor_reply(self._request("motor_off"))

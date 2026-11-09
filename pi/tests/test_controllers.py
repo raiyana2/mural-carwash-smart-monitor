@@ -152,11 +152,12 @@ class Bay1SensorTests(unittest.TestCase):
         self.assertTrue(any(s["status"] == "active" for s in bay1["sessions"]))
         self.assertIn("Started", controller.dashboard()["hardware"]["last_button_result"])
 
-        # Pressing again while it runs doesn't start a second run.
+        # Pressing again while it runs adds a minute instead of starting a second run.
         controller.hardware._on_esp_event({"type": "event", "event": "button", "pressed": True})
         self.poll(controller)
         self.assertEqual(sum(1 for call in link.calls if call[0] == "motor_on"), 1)
-        self.assertIn("Ignored", controller.dashboard()["hardware"]["last_button_result"])
+        self.assertIn(("motor_add", BUTTON_RUN_SECONDS), link.calls)
+        self.assertIn("Added", controller.dashboard()["hardware"]["last_button_result"])
 
     def test_button_is_ignored_when_the_bay_is_out_of_service(self):
         link = StubLink()

@@ -17,6 +17,7 @@
     {"id":1,"cmd":"motor_on","seconds":5}              run: turn to SERVO_ACTIVE_ANGLE (180°), hold 5 s,
     {"id":2,"cmd":"motor_on","seconds":5,"angle":90}     then turn back to the angle it started from
     {"id":2,"cmd":"motor_on","seconds":300,"label":"Wash $5.00"}   label = LCD line 1 during the run
+    {"id":3,"cmd":"motor_add","seconds":60,"label":"Wash $6.00"}   add time to the run in progress
     {"id":3,"cmd":"motor_off"}                         end a run now (turn back)
     {"id":4,"cmd":"motor_status"}                      is a run in progress? time left? angle?
     {"id":5,"cmd":"servo_set","angle":90}              move to 90° and stay there (refused during a run)
@@ -35,12 +36,12 @@
     {"type":"reply","id":8,"ok":true,"error":null,"data":{"distance_cm":42.7}}       (-1 = no echo in range)
     {"type":"reply","id":9,"ok":true,"error":null,"data":{"pressed":false}}
     {"type":"reply","id":13,"ok":true,"error":null,"data":{"uptime_s":42.0,"firmware":"motor_rain_controller",
-                                                           "version":2,"features":["motor","rain","distance","button","lcd"]}}
+                                                           "version":3,"features":["motor","extend","rain","distance","button","lcd"]}}
 
   Events (ESP32 -> Pi, unprompted):
     {"type":"event","event":"ready"}                                      after boot
     {"type":"event","event":"servo","angle":90,"running":false}           every time the angle changes
-    {"type":"event","event":"motor","running":true,"reason":"started","angle":180}
+    {"type":"event","event":"motor","running":true,"reason":"started","angle":180}   (or "extended")
     {"type":"event","event":"motor","running":false,"reason":"timer","angle":0}   (or "stopped")
     {"type":"event","event":"button","pressed":true}                      each time the button is pressed
 
@@ -56,7 +57,7 @@
 #include <LiquidCrystal_I2C.h>
 #include "../config.h"
 
-#define FIRMWARE_VERSION 2
+#define FIRMWARE_VERSION 3
 
 // ---------------- state ----------------
 Servo myServo;
@@ -156,6 +157,20 @@ void holdStart(float seconds, int angle, const char* label) {
   lcdWriteRow(0, lcdRunLabel);
   lcdShownSeconds = -1;
   lcdShowCountdown(holdMs);
+}
+
+// Add time to the run in progress (the servo stays where it is). The new label, if
+// any, replaces line 1 of the LCD (the dashboard sends the new price).
+void holdAdd(float seconds, const char* label) {
+  holdMs += (unsigned long)(seconds * 1000.0f);
+  if (label && label[0]) {
+    strncpy(lcdRunLabel, label, LCD_COLS);
+    lcdRunLabel[LCD_COLS] = '\0';
+    lcdWriteRow(0, lcdRunLabel);
+  }
+  lcdShownSeconds = -1;              // redraw the countdown with the new time
+  lcdShowCountdown(holdRemainingMs());
+  sendMotorEvent("extended");
 }
 
 void holdStop(const char* reason) {
@@ -279,6 +294,19 @@ void handleRequest(const char* text, size_t len) {
     }
     fillServoStatus(data);
 
+  } else if (cmd == "motor_add") {
+    float seconds = req["seconds"] | 0.0f;
+    if (!holdRunning) {
+      ok = false;
+      error = "no run in progress";
+    } else if (seconds <= 0 || holdRemainingMs() / 1000.0f + seconds > MAX_RUN_SECONDS) {
+      ok = false;
+      error = String("time left must stay <= ") + MAX_RUN_SECONDS + " s";
+    } else {
+      holdAdd(seconds, req["label"] | "");
+    }
+    fillServoStatus(data);
+
   } else if (cmd == "motor_off") {
     holdStop("stopped");
     fillServoStatus(data);
@@ -322,6 +350,7 @@ void handleRequest(const char* text, size_t len) {
     data["version"] = FIRMWARE_VERSION;
     JsonArray features = data["features"].to<JsonArray>();
     features.add("motor");
+    features.add("extend");
     features.add("rain");
     features.add("distance");
     features.add("button");
