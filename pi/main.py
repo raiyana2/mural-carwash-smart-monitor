@@ -21,7 +21,7 @@ import cmd
 import logging
 import time
 
-from esp32_link import Esp32Error, Esp32Link
+from esp32_link import Esp32ConnectError, Esp32Error, Esp32Link
 
 
 def print_event(evt: dict) -> None:
@@ -128,8 +128,14 @@ def main():
     a = ap.parse_args()
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.WARNING)
 
-    with Esp32Link(a.port, a.baud, on_event=print_event) as esp:
+    try:
+        esp = Esp32Link(a.port, a.baud, on_event=print_event).open()
+    except Esp32ConnectError as e:
+        raise SystemExit(f"Can't connect: {e}")
+    try:
         Shell(esp).cmdloop()
+    finally:
+        esp.close()
 
 
 if __name__ == "__main__":

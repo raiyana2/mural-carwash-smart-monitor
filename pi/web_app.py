@@ -1,7 +1,8 @@
 """Local multi-bay dashboard and the single owner of the Bay 1 serial link.
 
-Bay 1 is the physical ESP32: a positional servo (timed holds via motor_on/off,
-fixed positions via servo_set) and a rain sensor.
+Bay 1 is the physical ESP32: a positional servo and a rain sensor. A "run" turns
+the servo 180° (from 0° to 180°), holds it for the chosen number of seconds, then
+the ESP32 turns it back to 0° on its own timer. Bays 2–11 simulate the same thing.
 """
 
 from contextlib import asynccontextmanager
@@ -20,13 +21,21 @@ from pydantic import BaseModel, Field
 import serial
 
 from database import MonitorDatabase
-from esp32_link import Esp32Error, Esp32Link
+from esp32_link import Esp32ConnectError, Esp32Error, Esp32Link, list_serial_ports
 
 STATIC_DIR = Path(__file__).parent / "static"
 MAX_MOTOR_SECONDS = 300
+MOTOR_REST_ANGLE = 0      # where the servo waits between runs
+MOTOR_RUN_ANGLE = 180     # where a run turns it to
 HARDWARE_STALE_SECONDS = 10
 RAIN_STALE_SECONDS = 15
 WASH_MODES = ("Standard", "Rinse", "Foam", "Wax")
+# How long to wait before auto-connecting again after a failed attempt. A port that is
+# present but silent is retried slowly, so the dashboard doesn't keep the port open and
+# get in the way of a PlatformIO upload or serial monitor.
+RETRY_SECONDS = {"not_found": 3, "missing_port": 5, "busy": 10, "permission": 30, "no_answer": 20, "old_firmware": 60}
+RETRY_SECONDS_DEFAULT = 10
+LINK_ERRORS = (TimeoutError, serial.SerialException, OSError, RuntimeError)
 log = logging.getLogger(__name__)
 
 
@@ -49,13 +58,13 @@ class SettingsRequest(BaseModel):
     maximum_duration_seconds: int = Field(ge=1, le=MAX_MOTOR_SECONDS)
 
 
+class EnabledRequest(BaseModel):
+    enabled: bool
+
+
 class PreviewRequest(BaseModel):
     bay_number: int = Field(ge=1, le=11)
     seconds: int = Field(ge=1, le=MAX_MOTOR_SECONDS)
-
-
-class ServoRequest(BaseModel):
-    angle: int = Field(ge=0, le=180)
 
 
 class ScenarioRequest(BaseModel):
@@ -78,6 +87,7 @@ class MonitorController:
         serial_port: Optional[str] = None,
         run_simulator: bool = True,
         seed_demo_data: bool = True,
+        auto_connect: bool = True,
     ) -> None:
         self.database = database or MonitorDatabase()
         self.serial_port = serial_port
@@ -85,15 +95,19 @@ class MonitorController:
         self.seed_demo_data = seed_demo_data
         self._link: Optional[Esp32Link] = None
         self._link_source = "hardware"
-        self._lock = threading.RLock()
+        self._lock = threading.RLock()       # guards the link and Bay 1 state
+        self._open_lock = threading.Lock()   # only one attempt to open the port at a time
         self._stop = threading.Event()
         self._worker: Optional[threading.Thread] = None
         self._ever_connected = False
+        self._auto_connect = auto_connect    # paused by Disconnect, resumed by Connect
         self._next_connect_at = 0.0
         self._next_rain_at = 0.0
         self._next_sim_at = 0.0
         self._last_connection_error: Optional[str] = None
+        self._last_connection_error_kind: Optional[str] = None
         self._servo_angle: Optional[int] = None  # last angle reported by the ESP32 (Bay 1)
+        self._esp_restarted = False              # set by the reader thread on a "ready" event
         self._random = random.Random()
 
     def start(self) -> None:
@@ -152,9 +166,14 @@ class MonitorController:
                 (now,),
             )
 
+    # ------------------------------------------------------------------
+    # background worker
+    # ------------------------------------------------------------------
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
+                if self._link is None:
+                    self._maybe_auto_connect()   # opens the port without holding _lock
                 with self._lock:
                     self._poll_hardware_locked()
                     if self.run_simulator and time.time() >= self._next_sim_at:
@@ -164,65 +183,212 @@ class MonitorController:
                 log.exception("Bay monitor iteration failed")
             self._stop.wait(1)
 
-    def _poll_hardware_locked(self) -> None:
-        if self._link is None:
-            if time.time() < self._next_connect_at:
-                return
-            self._next_connect_at = time.time() + 3
-            link = Esp32Link(port=self.serial_port or os.getenv("ESP32_PORT") or None)
-            try:
-                link.open()
-                self._link = link
-                self._link_source = self._source_for_port(link.port)
-                self._ever_connected = True
-                self._last_connection_error = None
-                self.database.resolve_faults(1, "serial_connection_lost")
-            except (TimeoutError, serial.SerialException, OSError, RuntimeError) as exc:
-                link.close()
-                self._last_connection_error = str(exc)
-                return
+    # ------------------------------------------------------------------
+    # connecting
+    # ------------------------------------------------------------------
+    def _port_to_use(self) -> Optional[str]:
+        return self.serial_port or os.getenv("ESP32_PORT") or None
 
+    def _on_esp_event(self, event: dict) -> None:
+        # Runs on the serial reader thread; the worker handles it under the lock.
+        if event.get("event") == "ready":
+            self._esp_restarted = True
+
+    def _open_link(self) -> Esp32Link:
+        """Open and verify the ESP32. Raises Esp32ConnectError and records why it failed."""
+        link = Esp32Link(port=self._port_to_use(), on_event=self._on_esp_event)
+        try:
+            link.open()
+        except Esp32ConnectError as exc:
+            self._record_connect_failure(str(exc), exc.kind)
+            raise
+        except (Esp32Error, *LINK_ERRORS) as exc:
+            link.close()
+            message = f"The ESP32 answered, then a status request failed: {exc}"
+            self._record_connect_failure(message, "open_failed")
+            raise Esp32ConnectError(message, "open_failed", link.port) from exc
+        return link
+
+    def _record_connect_failure(self, message: str, kind: str) -> None:
+        self._last_connection_error = message
+        self._last_connection_error_kind = kind
+        self._next_connect_at = time.time() + RETRY_SECONDS.get(kind, RETRY_SECONDS_DEFAULT)
+
+    def _maybe_auto_connect(self) -> None:
+        if not self._auto_connect or time.time() < self._next_connect_at:
+            return
+        if not self._open_lock.acquire(blocking=False):
+            return  # a manual Connect is already opening the port
+        try:
+            if self._link is not None or not self._auto_connect:
+                return
+            try:
+                link = self._open_link()
+            except Esp32ConnectError:
+                return
+            with self._lock:
+                if self._auto_connect and self._link is None:
+                    self._install_link_locked(link)
+                    return
+            link.close()
+        finally:
+            self._open_lock.release()
+
+    def _install_link_locked(self, link: Esp32Link) -> None:
+        self._link = link
+        self._link_source = self._source_for_port(link.port)
+        self._ever_connected = True
+        self._last_connection_error = None
+        self._last_connection_error_kind = None
+        self._esp_restarted = False   # a reset while opening isn't news
+        self._next_rain_at = 0.0
+        self._servo_angle = link.angle
+        self.database.resolve_faults(1, "serial_connection_lost")
+
+    def connect_hardware(self, port: Optional[str]) -> dict:
+        with self._open_lock:
+            with self._lock:
+                self._close_link_locked()
+                self.serial_port = (port or "").strip() or None
+                self._auto_connect = True
+            try:
+                link = self._open_link()
+            except Esp32ConnectError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
+            with self._lock:
+                self._install_link_locked(link)
+                self._poll_hardware_locked()
+                if self._link is None:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"The ESP32 on {link.port} answered once, then stopped: {self._last_connection_error or 'no reply'}",
+                    )
+                return self.bay_detail(1)
+
+    def disconnect_hardware(self) -> dict:
+        with self._lock:
+            # Stay disconnected until Connect is pressed, so other programs
+            # (a PlatformIO upload, a serial monitor) can use the port.
+            self._auto_connect = False
+            self._close_link_locked()
+            self._mark_bay1_offline_locked()
+            return {"connected": False, "auto_connect": False}
+
+    def ping_hardware(self) -> dict:
+        with self._lock:
+            link = self._require_link_locked()
+            try:
+                uptime = link.ping()
+                motor = link.motor_status()
+            except Esp32Error as exc:
+                raise HTTPException(status_code=409, detail=f"The ESP32 refused: {exc}") from exc
+            except LINK_ERRORS as exc:
+                self._connection_lost_locked(exc)
+                raise HTTPException(status_code=503, detail=f"ESP32 ping failed: {exc}") from exc
+            self._record_motor_locked(motor)
+            return {"uptime_s": uptime, "connected": True}
+
+    @staticmethod
+    def _source_for_port(port: Optional[str]) -> str:
+        return "simulator" if port and port.startswith("/dev/pts/") else "hardware"
+
+    def _require_link_locked(self) -> Esp32Link:
+        if self._link is None or not self._hardware_status()["connected"]:
+            raise HTTPException(
+                status_code=503,
+                detail="Bay 1's ESP32 isn't connected. Connect it on the Maintenance page.",
+            )
+        return self._link
+
+    # ------------------------------------------------------------------
+    # polling Bay 1
+    # ------------------------------------------------------------------
+    def _poll_hardware_locked(self) -> None:
         link = self._link
         if link is None:
             return
+        if not link.connected:
+            self._connection_lost_locked(RuntimeError("the USB serial port closed (cable unplugged?)"))
+            return
         try:
-            uptime = link.ping()
             motor = link.motor_status()
-            self._servo_angle = motor.angle
-            now = time.time()
-            updates = {
+            reading = None
+            if time.time() >= self._next_rain_at:
+                reading = link.read_rain()
+                self._next_rain_at = time.time() + 5
+        except Esp32Error as exc:
+            # It answered, so the link is fine; just note the refusal.
+            log.warning("ESP32 refused a status request: %s", exc)
+            return
+        except LINK_ERRORS as exc:
+            self._connection_lost_locked(exc)
+            return
+        if reading is not None:
+            self.database.update_bay(
+                1,
+                {
+                    "rain_detected": int(reading.raining),
+                    "rain_raw": reading.raw,
+                    "rain_wet_percent": reading.wet_percent,
+                    "rain_updated_at": time.time(),
+                },
+            )
+        self._record_motor_locked(motor)
+
+    def _record_motor_locked(self, motor) -> None:
+        """Store the ESP32's motor state for Bay 1 and end a run the ESP32 has finished."""
+        now = time.time()
+        self._servo_angle = motor.angle
+        bay = self.database.get_bay(1)
+        active = next((s for s in bay["sessions"] if s["status"] == "active"), None)
+        if self._esp_restarted:
+            self._esp_restarted = False
+            self.database.add_fault(
+                1,
+                "hardware",
+                "esp32_restarted",
+                "warning",
+                "The ESP32 restarted on its own"
+                + (", ending the motor run early" if active else "")
+                + ". A common cause is powering the servo from the board's USB 5 V (it browns out "
+                "when the servo moves); give the servo its own 5 V supply with a shared ground.",
+                active["id"] if active else None,
+            )
+        if active and not motor.running:
+            self.database.end_session(1)
+        critical = any(f["active"] and f["severity"] == "critical" for f in bay["faults"])
+        self.database.update_bay(
+            1,
+            {
                 "last_seen_at": now,
                 "connection_source": self._link_source,
                 "motor_running": int(motor.running),
                 "motor_remaining_s": motor.remaining_s,
                 "motor_updated_at": now,
-                "status": "occupied" if motor.running else "available",
-            }
-            if now >= self._next_rain_at:
-                reading = link.read_rain()
-                updates.update(
-                    rain_detected=int(reading.raining),
-                    rain_raw=reading.raw,
-                    rain_wet_percent=reading.wet_percent,
-                    rain_updated_at=now,
-                )
-                self._next_rain_at = now + 5
-            self.database.update_bay(1, updates)
-            if not motor.running:
-                active_session = next(
-                    (session for session in self.database.get_bay(1)["sessions"] if session["status"] == "active"),
-                    None,
-                )
-                if active_session:
-                    self.database.end_session(1)
-            self._last_connection_error = None
-        except (Esp32Error, TimeoutError, serial.SerialException, OSError, RuntimeError) as exc:
-            self._last_connection_error = str(exc)
-            self._connection_lost_locked(exc)
+                "status": "occupied" if motor.running else ("faulted" if critical else "available"),
+            },
+        )
+        self._last_connection_error = None
+        self._last_connection_error_kind = None
 
     def _connection_lost_locked(self, error: Exception) -> None:
         was_connected = self._ever_connected
+        port = self._link.port if self._link else self._port_to_use()
         self._close_link_locked()
+        self._mark_bay1_offline_locked()
+        self._last_connection_error = f"Lost the ESP32 on {port}: {error}"
+        self._last_connection_error_kind = "lost"
+        self._next_connect_at = time.time() + 3
+        if was_connected:
+            self.database.add_fault(
+                1,
+                "hardware",
+                "serial_connection_lost",
+                "warning",
+                f"ESP32 serial communication stopped responding: {error}. Sensor values are unavailable until reconnection.",
+            )
+
+    def _mark_bay1_offline_locked(self) -> None:
         self.database.update_bay(
             1,
             {
@@ -233,14 +399,6 @@ class MonitorController:
                 "last_seen_at": None,
             },
         )
-        if was_connected:
-            self.database.add_fault(
-                1,
-                "hardware",
-                "serial_connection_lost",
-                "warning",
-                f"ESP32 serial communication stopped responding: {error}. Sensor values are unavailable until reconnection.",
-            )
 
     def _close_link_locked(self) -> None:
         self._servo_angle = None
@@ -248,102 +406,9 @@ class MonitorController:
             self._link.close()
             self._link = None
 
-    @staticmethod
-    def _source_for_port(port: Optional[str]) -> str:
-        return "simulator" if port and port.startswith("/dev/pts/") else "hardware"
-
-    def connect_hardware(self, port: Optional[str]) -> dict:
-        with self._lock:
-            self._close_link_locked()
-            self.serial_port = port or None
-            self._next_connect_at = 0
-            link = Esp32Link(port=self.serial_port or os.getenv("ESP32_PORT") or None)
-            try:
-                link.open()
-                self._link = link
-                self._link_source = self._source_for_port(link.port)
-                self._ever_connected = True
-                self._last_connection_error = None
-                self.database.resolve_faults(1, "serial_connection_lost")
-                self._poll_hardware_locked()
-                if self._link is None:
-                    raise HTTPException(
-                        status_code=503,
-                        detail=f"ESP32 did not stay connected: {self._last_connection_error or 'no reply'}",
-                    )
-                return self.bay_detail(1)
-            except (TimeoutError, serial.SerialException, OSError, RuntimeError) as exc:
-                link.close()
-                self._link = None
-                self._last_connection_error = str(exc)
-                raise HTTPException(status_code=503, detail=f"Could not connect to Bay 1 ESP32: {exc}") from exc
-
-    def disconnect_hardware(self) -> dict:
-        with self._lock:
-            self._close_link_locked()
-            self.database.update_bay(
-                1,
-                {
-                    "status": "offline",
-                    "motor_running": None,
-                    "motor_remaining_s": None,
-                    "motor_updated_at": None,
-                    "last_seen_at": None,
-                },
-            )
-            return {"connected": False}
-
-    def ping_hardware(self) -> dict:
-        with self._lock:
-            link = self._require_link_locked()
-            try:
-                uptime = link.ping()
-                motor = link.motor_status()
-                self.database.update_bay(
-                    1,
-                    {
-                        "last_seen_at": time.time(),
-                        "connection_source": self._link_source,
-                        "motor_running": int(motor.running),
-                        "motor_remaining_s": motor.remaining_s,
-                        "motor_updated_at": time.time(),
-                        "status": "occupied" if motor.running else "available",
-                    },
-                )
-                return {"uptime_s": uptime, "connected": True}
-            except (Esp32Error, TimeoutError, serial.SerialException, OSError, RuntimeError) as exc:
-                self._connection_lost_locked(exc)
-                raise HTTPException(status_code=503, detail=f"ESP32 ping failed: {exc}") from exc
-
-    def dashboard(self) -> dict:
-        result = self.database.dashboard()
-        hardware = self._hardware_status()
-        result["hardware"] = hardware
-        physical = result["bays"][0]
-        physical["connected"] = hardware["connected"]
-        physical["connected_port"] = hardware["port"]
-        if (
-            not physical["rain_updated_at"]
-            or time.time() - physical["rain_updated_at"] > RAIN_STALE_SECONDS
-            or not hardware["connected"]
-        ):
-            physical["rain_detected"] = None
-            physical["rain_raw"] = None
-            physical["rain_wet_percent"] = None
-        if (
-            not physical["motor_updated_at"]
-            or time.time() - physical["motor_updated_at"] > HARDWARE_STALE_SECONDS
-            or not hardware["connected"]
-        ):
-            physical["motor_running"] = None
-            physical["motor_remaining_s"] = None
-            physical["servo_angle"] = None
-        else:
-            physical["servo_angle"] = self._servo_angle
-        for bay in result["bays"][1:]:
-            bay["servo_angle"] = None
-        return result
-
+    # ------------------------------------------------------------------
+    # reading state
+    # ------------------------------------------------------------------
     def _hardware_status(self) -> dict:
         bay = self.database.get_bay(1)
         connected = bool(
@@ -352,40 +417,72 @@ class MonitorController:
             and bay["last_seen_at"]
             and time.time() - bay["last_seen_at"] <= HARDWARE_STALE_SECONDS
         )
+        retry_in = None
+        if not connected and self._auto_connect:
+            retry_in = max(0, round(self._next_connect_at - time.time()))
         return {
             "connected": connected,
-            "port": self._link.port if connected and self._link else self.serial_port,
-            "last_error": self._last_connection_error,
+            "port": self._link.port if connected and self._link else self._port_to_use(),
+            "last_error": None if connected else self._last_connection_error,
+            "last_error_kind": None if connected else self._last_connection_error_kind,
             "last_seen_at": bay["last_seen_at"] if bay else None,
+            "auto_connect": self._auto_connect,
+            "retry_in_s": retry_in,
         }
+
+    def _decorate_bay(self, bay: dict, hardware: dict, now: float) -> dict:
+        """Add live fields the UI needs: connection, servo angle, and time left in the run."""
+        bay["remaining_seconds"] = None
+        bay["run_seconds"] = bay.get("active_granted_seconds")
+        if bay["source"] == "hardware":
+            bay["connected"] = hardware["connected"]
+            bay["connected_port"] = hardware["port"]
+            if not bay["rain_updated_at"] or now - bay["rain_updated_at"] > RAIN_STALE_SECONDS or not hardware["connected"]:
+                bay["rain_detected"] = None
+                bay["rain_raw"] = None
+                bay["rain_wet_percent"] = None
+            if not bay["motor_updated_at"] or now - bay["motor_updated_at"] > HARDWARE_STALE_SECONDS or not hardware["connected"]:
+                bay["motor_running"] = None
+                bay["motor_remaining_s"] = None
+                bay["servo_angle"] = None
+            else:
+                bay["servo_angle"] = self._servo_angle
+                if bay["motor_running"]:
+                    # The ESP32's own timer is the truth; allow for the time since the last poll.
+                    bay["remaining_seconds"] = max(
+                        0, round(bay["motor_remaining_s"] - (now - bay["motor_updated_at"]))
+                    )
+        else:
+            bay["connected"] = True
+            bay["connected_port"] = None
+            bay["servo_angle"] = MOTOR_RUN_ANGLE if bay["motor_running"] else MOTOR_REST_ANGLE
+            if bay.get("active_started_at") is not None:
+                elapsed = max(0, int(now - bay["active_started_at"]))
+                bay["remaining_seconds"] = max(0, bay["active_granted_seconds"] - elapsed)
+        return bay
+
+    def dashboard(self) -> dict:
+        result = self.database.dashboard()
+        hardware = self._hardware_status()
+        now = time.time()
+        result["hardware"] = hardware
+        result["bays"] = [self._decorate_bay(bay, hardware, now) for bay in result["bays"]]
+        result["motor_run_angle"] = MOTOR_RUN_ANGLE
+        result["motor_rest_angle"] = MOTOR_REST_ANGLE
+        return result
 
     def bay_detail(self, bay_number: int) -> dict:
         bay = self.database.get_bay(bay_number)
         if bay is None:
             raise HTTPException(status_code=404, detail="Bay not found")
-        now = time.time()
-        bay["connected"] = bay_number == 1 and self._hardware_status()["connected"]
-        bay["connected_port"] = self._hardware_status()["port"] if bay_number == 1 else None
-        if bay_number == 1:
-            if not bay["rain_updated_at"] or now - bay["rain_updated_at"] > RAIN_STALE_SECONDS:
-                bay["rain_detected"] = None
-                bay["rain_raw"] = None
-                bay["rain_wet_percent"] = None
-            if not bay["motor_updated_at"] or now - bay["motor_updated_at"] > HARDWARE_STALE_SECONDS:
-                bay["motor_running"] = None
-                bay["motor_remaining_s"] = None
-                bay["servo_angle"] = None
-            else:
-                bay["servo_angle"] = self._servo_angle if bay["connected"] else None
-        else:
-            bay["servo_angle"] = None
-        bay["remaining_seconds"] = None
-        active = next((session for session in bay["sessions"] if session["status"] == "active"), None)
-        if active:
-            elapsed = max(0, int(now - active["started_at"]))
-            bay["remaining_seconds"] = max(0, active["granted_seconds"] - elapsed)
-        return bay
+        active = next((s for s in bay["sessions"] if s["status"] == "active"), None)
+        bay["active_started_at"] = active["started_at"] if active else None
+        bay["active_granted_seconds"] = active["granted_seconds"] if active else None
+        return self._decorate_bay(bay, self._hardware_status(), time.time())
 
+    # ------------------------------------------------------------------
+    # settings
+    # ------------------------------------------------------------------
     def update_settings(self, bay_number: int, values: dict) -> dict:
         with self._lock:
             return self._update_settings(bay_number, values)
@@ -405,6 +502,17 @@ class MonitorController:
         self.database.update_settings(bay_number, {**values, "enabled": int(values["enabled"])})
         return self.bay_detail(bay_number)
 
+    def set_enabled(self, bay_number: int, enabled: bool) -> dict:
+        """Put a bay in or out of service (Maintenance page)."""
+        with self._lock:
+            bay = self.database.get_bay(bay_number)
+            if bay is None:
+                raise HTTPException(status_code=404, detail="Bay not found")
+            if not enabled and (bay["status"] == "occupied" or bay["motor_running"]):
+                raise HTTPException(status_code=409, detail="Wait for the run to finish (or press Return now) before taking this bay out of service")
+            self.database.update_bay(bay_number, {"enabled": int(enabled)})
+            return self.bay_detail(bay_number)
+
     def preview(self, bay_number: int, seconds: int) -> dict:
         bay = self.database.get_bay(bay_number)
         if bay is None:
@@ -416,6 +524,9 @@ class MonitorController:
             )
         return {"seconds": seconds, "price_cents": price_for_seconds(bay, seconds)}
 
+    # ------------------------------------------------------------------
+    # motor runs
+    # ------------------------------------------------------------------
     def start_session(self, bay_number: int, seconds: int, mode: Optional[str]) -> dict:
         with self._lock:
             return self._start_session(bay_number, seconds, mode)
@@ -425,66 +536,51 @@ class MonitorController:
         if bay is None:
             raise HTTPException(status_code=404, detail="Bay not found")
         if not bay["enabled"]:
-            raise HTTPException(status_code=409, detail="This bay is disabled")
+            raise HTTPException(status_code=409, detail=f"{bay['label']} is out of service. Put it back in service on the Maintenance page.")
         if bay["status"] == "faulted":
-            raise HTTPException(status_code=409, detail="Resolve the active bay fault before starting a wash")
+            raise HTTPException(status_code=409, detail=f"{bay['label']} has an open fault. Resolve it on the Maintenance page first.")
         if any(session["status"] == "active" for session in bay["sessions"]):
-            raise HTTPException(status_code=409, detail=f"{bay['label']} already has an active session")
-        if seconds > bay["maximum_duration_seconds"] or seconds > MAX_MOTOR_SECONDS:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Wash duration exceeds the bay or ESP32 maximum ({min(bay['maximum_duration_seconds'], MAX_MOTOR_SECONDS)} seconds)",
-            )
+            raise HTTPException(status_code=409, detail=f"{bay['label']}'s motor is already running")
+        limit = min(bay["maximum_duration_seconds"], MAX_MOTOR_SECONDS)
+        if seconds > limit:
+            raise HTTPException(status_code=422, detail=f"Run time can be at most {limit} seconds for {bay['label']}")
         if mode and mode not in WASH_MODES:
             raise HTTPException(status_code=422, detail="Unsupported wash mode")
         wash_mode = mode or bay["default_wash_mode"]
         if bay["source"] == "hardware":
-            with self._lock:
-                link = self._require_link_locked()
-                try:
-                    if link.motor_status().running:
-                        raise HTTPException(status_code=409, detail="Bay 1 motor is already running")
-                    motor = link.motor_on(seconds)
-                    self._servo_angle = motor.angle
-                    session_id = self.database.start_session(
-                        bay_number,
-                        self._link_source,
-                        wash_mode,
-                        seconds,
-                        seconds,
-                        price_for_seconds(bay, seconds),
-                    )
-                    self.database.update_bay(
-                        1,
-                        {
-                            "status": "occupied",
-                            "motor_running": int(motor.running),
-                            "motor_remaining_s": motor.remaining_s,
-                            "motor_updated_at": time.time(),
-                        },
-                    )
-                    return {"session_id": session_id, **self.bay_detail(1)}
-                except HTTPException:
-                    raise
-                except (Esp32Error, TimeoutError, serial.SerialException, OSError, RuntimeError) as exc:
-                    self._connection_lost_locked(exc)
-                    raise HTTPException(status_code=503, detail=f"Bay 1 motor command failed: {exc}") from exc
+            link = self._require_link_locked()
+            try:
+                status = link.motor_status()
+                if status.running:
+                    raise HTTPException(status_code=409, detail="Bay 1's motor is already running. Press Return now first.")
+                if status.angle is not None and status.angle != MOTOR_REST_ANGLE:
+                    # Start from rest so a run is always the full 0° -> 180° turn, and the
+                    # ESP32 turns it back to 0° when the timer ends.
+                    try:
+                        link.servo_set(MOTOR_REST_ANGLE)
+                    except Esp32Error:
+                        pass  # older firmware without servo_set returns to rest by itself
+                motor = link.motor_on(seconds, angle=MOTOR_RUN_ANGLE)
+            except HTTPException:
+                raise
+            except Esp32Error as exc:
+                # The ESP32 answered and said no: the link is fine, so don't drop it.
+                raise HTTPException(status_code=409, detail=f"The ESP32 refused the run: {exc}") from exc
+            except LINK_ERRORS as exc:
+                self._connection_lost_locked(exc)
+                raise HTTPException(status_code=503, detail=f"Bay 1 motor command failed: {exc}") from exc
+            session_id = self.database.start_session(
+                bay_number, self._link_source, wash_mode, seconds, seconds, price_for_seconds(bay, seconds)
+            )
+            self._record_motor_locked(motor)
+            return {"session_id": session_id, **self.bay_detail(1)}
         try:
             session_id = self.database.start_session(
-                bay_number,
-                "simulator",
-                wash_mode,
-                seconds,
-                seconds,
-                price_for_seconds(bay, seconds),
+                bay_number, "simulator", wash_mode, seconds, seconds, price_for_seconds(bay, seconds)
             )
             self.database.update_bay(
                 bay_number,
-                {
-                    "motor_running": 1,
-                    "motor_remaining_s": float(seconds),
-                    "motor_updated_at": time.time(),
-                },
+                {"motor_running": 1, "motor_remaining_s": float(seconds), "motor_updated_at": time.time()},
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -495,67 +591,30 @@ class MonitorController:
             return self._stop_session(bay_number)
 
     def _stop_session(self, bay_number: int) -> dict:
+        """Turn the motor back now. Works whenever it's running, even with no recorded run
+        (for example one started before the dashboard restarted)."""
         bay = self.database.get_bay(bay_number)
         if bay is None:
             raise HTTPException(status_code=404, detail="Bay not found")
         if bay["source"] == "hardware":
-            with self._lock:
-                link = self._require_link_locked()
-                try:
-                    motor = link.motor_off()
-                    self._servo_angle = motor.angle
-                    self.database.end_session(bay_number, "completed")
-                    self.database.update_bay(
-                        1,
-                        {
-                            "status": "available",
-                            "motor_running": int(motor.running),
-                            "motor_remaining_s": motor.remaining_s,
-                            "motor_updated_at": time.time(),
-                        },
-                    )
-                except (Esp32Error, TimeoutError, serial.SerialException, OSError, RuntimeError) as exc:
-                    self._connection_lost_locked(exc)
-                    raise HTTPException(status_code=503, detail=f"Bay 1 motor stop failed: {exc}") from exc
+            link = self._require_link_locked()
+            try:
+                motor = link.motor_off()
+            except Esp32Error as exc:
+                raise HTTPException(status_code=409, detail=f"The ESP32 refused to stop: {exc}") from exc
+            except LINK_ERRORS as exc:
+                self._connection_lost_locked(exc)
+                raise HTTPException(status_code=503, detail=f"Bay 1 motor stop failed: {exc}") from exc
+            self.database.end_session(bay_number, "completed")
+            self._record_motor_locked(motor)
         else:
             self.database.end_session(bay_number, "completed")
+            self.database.update_bay(bay_number, {"motor_running": 0, "motor_remaining_s": 0})
         return self.bay_detail(bay_number)
 
-    def set_servo_angle(self, bay_number: int, angle: int) -> dict:
-        """Move the Bay 1 servo to `angle` and leave it there (firmware servo_set)."""
-        bay = self.database.get_bay(bay_number)
-        if bay is None:
-            raise HTTPException(status_code=404, detail="Bay not found")
-        if bay["source"] != "hardware":
-            raise HTTPException(status_code=422, detail="Only the physical Bay 1 has a servo")
-        with self._lock:
-            link = self._require_link_locked()
-            if any(session["status"] == "active" for session in bay["sessions"]):
-                raise HTTPException(status_code=409, detail="Stop the active wash before moving the servo")
-            try:
-                status = link.servo_set(angle)
-            except Esp32Error as exc:
-                # The ESP32 answered but refused (e.g. a timed hold is running): not a link failure.
-                raise HTTPException(status_code=409, detail=f"ESP32 refused the move: {exc}") from exc
-            except (TimeoutError, serial.SerialException, OSError, RuntimeError) as exc:
-                self._connection_lost_locked(exc)
-                raise HTTPException(status_code=503, detail=f"Bay 1 servo command failed: {exc}") from exc
-            self._servo_angle = status.angle
-            self.database.update_bay(
-                1,
-                {
-                    "motor_running": int(status.running),
-                    "motor_remaining_s": status.remaining_s,
-                    "motor_updated_at": time.time(),
-                },
-            )
-        return self.bay_detail(bay_number)
-
-    def _require_link_locked(self) -> Esp32Link:
-        if self._link is None or not self._hardware_status()["connected"]:
-            raise HTTPException(status_code=503, detail="Bay 1 ESP32 is disconnected or its status is stale")
-        return self._link
-
+    # ------------------------------------------------------------------
+    # simulator
+    # ------------------------------------------------------------------
     def trigger_scenario(self, bay_number: int, scenario: str) -> dict:
         with self._lock:
             return self._trigger_scenario(bay_number, scenario)
@@ -611,7 +670,11 @@ class MonitorController:
                 {"motor_running": 1, "motor_remaining_s": float(granted), "motor_updated_at": time.time()},
             )
         elif scenario in ("motor_feedback_missing", "water_not_detected"):
+            if bay["status"] == "faulted":
+                raise HTTPException(status_code=409, detail="Resolve this bay's open fault first")
             if bay["status"] != "occupied":
+                if not bay["enabled"]:
+                    raise HTTPException(status_code=409, detail="Put this bay back in service first")
                 self.start_session(
                     bay_number, min(180, bay["maximum_duration_seconds"]), bay["default_wash_mode"]
                 )
@@ -632,7 +695,7 @@ class MonitorController:
                 )
         elif scenario == "session_overrun":
             if bay["status"] == "occupied":
-                raise HTTPException(status_code=409, detail="End the current session before injecting an overrun")
+                raise HTTPException(status_code=409, detail="Wait for the current run to end before injecting an overrun")
             if bay["status"] == "faulted":
                 raise HTTPException(status_code=409, detail="Resolve the active bay fault before injecting an overrun")
             max_seconds = bay["maximum_duration_seconds"]
@@ -646,6 +709,9 @@ class MonitorController:
                     "UPDATE sessions SET started_at = ? WHERE id = ?",
                     (time.time() - max_seconds - 2, session_id),
                 )
+            self.database.update_bay(
+                bay_number, {"motor_running": 1, "motor_remaining_s": 28.0, "motor_updated_at": time.time()}
+            )
             self.database.add_fault(
                 bay_number, "simulator", scenario, "critical",
                 f"Simulated active session exceeded the configured {max_seconds} second limit. This is a test scenario.",
@@ -776,6 +842,11 @@ def update_settings(bay_number: int, request: SettingsRequest) -> dict:
     return controller.update_settings(bay_number, values)
 
 
+@app.put("/api/bays/{bay_number}/enabled")
+def set_enabled(bay_number: int, request: EnabledRequest) -> dict:
+    return controller.set_enabled(bay_number, request.enabled)
+
+
 @app.post("/api/bays/{bay_number}/start")
 def start_session(bay_number: int, request: SessionRequest) -> dict:
     return controller.start_session(bay_number, request.seconds, request.wash_mode)
@@ -786,9 +857,9 @@ def stop_session(bay_number: int) -> dict:
     return controller.stop_session(bay_number)
 
 
-@app.post("/api/bays/{bay_number}/servo")
-def set_servo_angle(bay_number: int, request: ServoRequest) -> dict:
-    return controller.set_servo_angle(bay_number, request.angle)
+@app.get("/api/hardware/ports")
+def hardware_ports() -> list[dict]:
+    return list_serial_ports()
 
 
 @app.post("/api/hardware/connect")

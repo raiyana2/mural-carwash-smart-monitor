@@ -6,9 +6,9 @@ Offline Raspberry Pi + ESP32 prototype for monitoring and demonstrating an 11-ba
 Browser dashboard ──HTTP──> Raspberry Pi (pi/web_app.py) ──USB serial──> ESP32 (src/, PlatformIO) ──> servo + rain sensor
 ```
 
-- Bay 1 is the real ESP32 test bay: a positional servo and a rain sensor, reached through the `Esp32Link` USB serial client.
+- Bay 1 is the real ESP32 test bay: a positional servo and a rain sensor, reached through the `Esp32Link` USB serial client. A run turns the servo from 0° to 180°, holds it for the chosen time, and the ESP32 turns it back to 0° on its own timer.
 - Bays 2–11 are explicitly labelled local simulator bays.
-- FastAPI serves the local operations dashboard; SQLite stores bay settings, pricing, sessions, and fault history.
+- FastAPI serves the local dashboard (Operations, Bay Manager, Maintenance); SQLite stores bay settings, runs, and fault history.
 - Payments and multi-bay data are simulated. The application does not connect to a real payment system.
 
 | Folder | What's in it |
@@ -18,7 +18,9 @@ Browser dashboard ──HTTP──> Raspberry Pi (pi/web_app.py) ──USB seria
 
 ## Firmware
 
-**Build and upload:** open the repo folder in VS Code with the **PlatformIO** extension, then click **Upload** (→), or run `pio run -t upload`. The board is the **Adafruit Feather ESP32 V2**. PlatformIO installs the libraries (ArduinoJson 7, ESP32Servo 3) automatically. Close any serial monitor before running the Pi code, because only one program can use the port at a time.
+**Build and upload:** open the repo folder in VS Code with the **PlatformIO** extension, then click **Upload** (→), or run `pio run -t upload`. The board is the **Adafruit Feather ESP32 V2**. PlatformIO installs the libraries (ArduinoJson 7, ESP32Servo 3) automatically. Only one program can use the port at a time: if the dashboard is running, press **Disconnect** on its Maintenance page before uploading, and close any serial monitor before connecting the dashboard.
+
+**Arduino IDE instead:** open `esp32/motor_rain_controller/motor_rain_controller.ino`. It is the same firmware as `src/main.cpp` with the `config.h` settings written into the sketch, so it compiles on its own. Install ArduinoJson 7 and ESP32Servo 3 from the Library Manager first.
 
 ### Wiring (pins in `include/config.h`)
 

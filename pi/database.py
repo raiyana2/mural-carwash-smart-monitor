@@ -154,7 +154,11 @@ class MonitorDatabase:
                        (SELECT COUNT(*) FROM faults f
                         WHERE f.bay_number = b.bay_number AND f.active = 1) AS active_fault_count,
                        (SELECT MAX(s.started_at) FROM sessions s
-                        WHERE s.bay_number = b.bay_number) AS last_session_at
+                        WHERE s.bay_number = b.bay_number) AS last_session_at,
+                       (SELECT s.started_at FROM sessions s
+                        WHERE s.bay_number = b.bay_number AND s.status = 'active') AS active_started_at,
+                       (SELECT s.granted_seconds FROM sessions s
+                        WHERE s.bay_number = b.bay_number AND s.status = 'active') AS active_granted_seconds
                 FROM bays b JOIN pricing_settings p USING (bay_number)
                 ORDER BY b.bay_number
                 """
@@ -424,6 +428,10 @@ class MonitorDatabase:
                 "SELECT COALESCE(SUM(price_cents), 0) FROM sessions WHERE source = 'simulator'"
             ).fetchone()[0]
             visits = db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+            midnight = time.mktime(time.localtime()[:3] + (0, 0, 0, 0, 0, -1))
+            runs_today = db.execute(
+                "SELECT COUNT(*) FROM sessions WHERE started_at >= ?", (midnight,)
+            ).fetchone()[0]
             active_faults = db.execute("SELECT COUNT(*) FROM faults WHERE active = 1").fetchone()[0]
         return {
             "bays": bays,
@@ -434,6 +442,7 @@ class MonitorDatabase:
             ),
             "faulted_bays": sum(bay["status"] == "faulted" for bay in bays),
             "customer_visits": visits,
+            "runs_today": runs_today,
             "active_faults": active_faults,
             "recent_faults": self.recent_faults(),
         }

@@ -4,10 +4,10 @@ The Raspberry Pi hosts a local FastAPI application and SQLite database. Its brow
 
 | Bay | Source | Data and control |
 |---|---|---|
-| 1 | Hardware | One `Esp32Link` instance communicates with the real ESP32 over USB serial. Rain, servo state and angle, ping, and servo commands come from the firmware protocol (see the [main README](../README.md)). The documented physical bay has no vehicle, wash-water flow, or independent motor-feedback sensor. |
-| 2–11 | Simulator | Local Python simulator generates labelled demo customer sessions, timer and mode changes, sensor state, payments, and occasional faults. No serial hardware is used for these bays. |
+| 1 | Hardware | One `Esp32Link` instance communicates with the real ESP32 over USB serial. Rain, motor state and angle, ping, and the timed 180° run come from the firmware protocol (see the [main README](../README.md)). The documented physical bay has no vehicle, wash-water flow, or independent motor-feedback sensor. |
+| 2–11 | Simulator | Local Python simulator mirrors the same 180° timed run, generates labelled demo activity and occasional faults. No serial hardware is used for these bays. |
 
-`esp32_link.py` remains the only Python serial client. The web service uses its `open()`, `ping()`, `read_rain()`, `motor_status()`, `motor_on()`, `motor_off()` and `servo_set()` methods. A background worker owns that one Bay 1 connection, polls it, and retries after a disconnect. Serial calls run outside the browser request loop. The interactive CLI and command-line examples remain available.
+`esp32_link.py` remains the only Python serial client. The web service uses its `open()`, `ping()`, `read_rain()`, `motor_status()`, `motor_on()` and `motor_off()` methods (and `servo_set(0)` only to put the servo back at rest before a run). A background worker owns that one Bay 1 connection, polls it, and retries after a disconnect; **Disconnect** pauses those retries until **Connect** is pressed. Serial calls run outside the browser request loop. The interactive CLI and command-line examples remain available.
 
 The application safely initializes its SQLite schema (`bays`, `pricing_settings`, `sessions`, `faults`) at startup. Bay configuration, integer-cent prices, session records, and fault history persist across restarts. The default database is `pi/data/monitor.sqlite3`; set `MURAL_MONITOR_DB` to use another local path. All payments and revenue in this milestone are simulated. No external API, payment processor, CDN, or internet connection is used at runtime.
 
@@ -35,13 +35,23 @@ source .venv/bin/activate
 python -m uvicorn web_app:app --host 127.0.0.1 --port 8000
 ```
 
-Open <http://127.0.0.1:8000> on the Raspberry Pi. This loopback-only default keeps control local to the Pi. Bay 1 attempts the `ESP32_PORT` environment variable when set, then uses the existing USB VID auto-detection. To select a port in the UI, open **Bay 1** and enter its serial path (for example `/dev/ttyUSB0`) before connecting. Only this web process should own that serial port; close the PlatformIO/Arduino serial monitor and any other serial client first.
+Open <http://127.0.0.1:8000> on the Raspberry Pi. This loopback-only default keeps control local to the Pi. Bay 1 attempts the `ESP32_PORT` environment variable when set, then uses USB auto-detection. To pick a port in the UI, open **Maintenance**, press **Scan ports**, press **Use** next to the board (`/dev/ttyUSB0` or `/dev/ttyACM0` on the Pi, `COM5`-style on Windows), then **Connect**. Only this web process should own that serial port; close the PlatformIO/Arduino serial monitor and any other serial client first.
 
-Bay 1 start/stop controls call the firmware's timed hold (`motor_on` / `motor_off`): the servo moves to its active angle (180° by default) for the wash time, then returns to the angle it was at before. The firmware remains responsible for that independent timer and its 300-second maximum. The **Servo position** control on the Bay 1 page moves the servo to a chosen angle and leaves it there (`servo_set`, `POST /api/bays/1/servo`); it is refused while a wash is running. Bay 1 rain sensor values become **Unknown** when missing or stale, and vehicle/wash-flow sensors are shown as **Unavailable** because they are not part of the documented wiring. ESP32-reported motor status is command/controller state, not independent relay feedback.
+On Windows (for development), the same steps are:
+
+```powershell
+cd C:\Repos\mural-carwash-smart-monitor\pi
+py -m venv .venv
+.venv\Scripts\activate
+python -m pip install -r requirements.txt
+python -m uvicorn web_app:app --host 127.0.0.1 --port 8000
+```
+
+Each bay's controls in **Bay Manager** are a run time and two buttons. **Run 180°** turns the motor from 0° to 180°, holds it for the run time, then turns it back to 0°; **Return now** turns it back early. On Bay 1 this is the firmware's timed hold (`motor_on` with angle 180, `motor_off`), so the ESP32 enforces the timer and its 300-second maximum by itself. If the servo isn't at 0° when a run starts (for example after the command-line `angle` tool), the Pi sends it to 0° first so every run is the full 180° turn. **Return now** works whenever the motor is running, including a run started before the dashboard restarted. Bay 1 rain sensor values become **Unknown** when missing or stale. ESP32-reported motor status is command/controller state, not independent relay feedback.
 
 ## Demo simulator
 
-The dashboard simulates Bays 2–11 locally as soon as the server starts. It seeds clearly labelled sample activity on a new database, then generates session arrivals, departures, timer activity, wash mode changes, sensor state, and occasional equipment faults. Use **Fault simulation** to manually trigger a customer arrival/departure, wash-mode change, purchased/granted-time anomaly, missing simulated motor feedback, missing simulated water detection, overrun, or operator test fault. These scenarios only affect simulator bays.
+The dashboard simulates Bays 2–11 locally as soon as the server starts. It seeds clearly labelled sample activity on a new database, then starts occasional simulated runs and equipment faults. Use **Test faults** on the Maintenance page to inject missing motor feedback, missing water detection, a run that overran its limit, or an operator test fault. These scenarios only affect simulator bays.
 
 To test the original USB serial protocol and Bay 1 screen without physical hardware, run the existing fake ESP32 in another terminal:
 
@@ -51,7 +61,7 @@ source .venv/bin/activate
 python fake_esp32.py
 ```
 
-Copy the printed virtual serial path (for example `/dev/pts/3`) into the **Bay 1** connection field and select **Connect ESP32**. This test connects the ordinary `Esp32Link` client to the simulator; it does not change Bay 1's configured hardware data source or provide real sensor evidence. Stop the fake device with Ctrl+C; the dashboard should mark Bay 1 offline and record a serial-loss incident after a successful connection has been lost.
+Copy the printed virtual serial path (for example `/dev/pts/3`) into the **Serial port** field on the Maintenance page and press **Connect**. This test connects the ordinary `Esp32Link` client to the simulator; it does not change Bay 1's configured hardware data source or provide real sensor evidence. Stop the fake device with Ctrl+C; the dashboard should mark Bay 1 offline and record a serial-loss incident after a successful connection has been lost.
 
 ## Development and tests
 
@@ -74,11 +84,33 @@ python example.py /dev/ttyUSB0
 
 Interactive commands are `angle DEGREES`, `on SECONDS [ANGLE]`, `off`, `status`, `rain`, `watch [SECONDS]`, `ping`, `help`, and `quit`. See [Command-line tools and the serial client](#command-line-tools-and-the-serial-client) below.
 
-## Industrial operations interface
+## The three pages
 
-The operations view uses a conceptual eleven-bay layout, pending confirmation of the actual floor plan. Its featured Bay 1 physical connection opens the live USB, ESP32 servo, and rain-sensor view. Bays 2–11 expose labelled **Test controls** links that preselect the bay in Fault Diagnostics. A pricing mismatch scenario displays purchased time, granted time, and their recorded difference. It does not infer a root cause.
+| Page | What it's for |
+|---|---|
+| **Operations** | Live overview: how many bays are ready or running, the wash floor (each bay's motor position and countdown), what needs attention, and run counts. Select a bay to open it in Bay Manager. |
+| **Bay Manager** | One card per bay with a run time, **Run 180°** and **Return now**. Bay 1 also shows the rain plate. A dial shows where the motor is (0° resting, 180° running). |
+| **Maintenance** | The Bay 1 ESP32 connection (port picker, Connect / Disconnect / Ping, and the last connection error), open faults with **Resolve**, putting bays in or out of service, simulator test faults, and the fault log. |
 
-The interface bundles IBM Plex Sans and Mono in `static/fonts` with their license and requires no font CDN. The compact Raspberry Pi layout keeps the map scrollable and provides touch-sized test controls. Operational counts come from the existing APIs; unavailable physical readings remain unknown. All payment figures remain simulated.
+Pricing, wash modes and analytics are no longer in the interface. Their API routes (`/api/pricing/preview`, `/api/bays/{n}/settings`, `/api/analytics`) still exist, and runs are still saved in SQLite.
+
+The interface bundles IBM Plex Sans and Mono in `static/fonts` with their license and requires no font CDN. Pages are drawn once and then patched every second, so countdowns stay live without clearing what you type.
+
+## Troubleshooting the ESP32 connection
+
+When **Connect** fails, the Maintenance page shows the reason in red. What each one means:
+
+| Message starts with | What to do |
+|---|---|
+| "No ESP32 found on USB" | The list shows every port the computer can see. If none looks like the board, try another USB cable (many are charge-only) and check the board's USB driver (CP210x or CH340/CH9102). Otherwise pick the port yourself. |
+| "There is no port called …" | The port name is wrong for this computer: `COM5`-style on Windows, `/dev/ttyUSB0` or `/dev/ttyACM0` on the Pi. Press **Scan ports** and **Use** the right one. |
+| "… is already in use by another program" | Close the PlatformIO/Arduino serial monitor, wait for any upload to finish, and make sure only one dashboard (or `main.py`) is running. |
+| "No permission to open …" (Pi) | `sudo usermod -aG dialout $USER`, then log out and back in. |
+| "… opened, but the ESP32 didn't answer" | The port works but the firmware isn't replying. Upload `src/main.cpp` (PlatformIO → Upload), press the board's RESET button, and connect again. The dashboard already pulsed the reset line once before giving up. |
+
+To upload firmware while the dashboard is running, press **Disconnect** first. The dashboard then stays off the port until you press **Connect**, so the upload isn't interrupted.
+
+If Bay 1 logs "The ESP32 restarted on its own", the board is browning out, usually because the servo is powered from the board's USB 5 V. Give the servo its own 5 V supply and connect its ground to the ESP32's GND.
 
 ## Command-line tools and the serial client
 
