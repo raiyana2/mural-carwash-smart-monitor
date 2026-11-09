@@ -1,11 +1,16 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <ESP32Servo.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
 #include "config.h"
 
 // ---------------- state ----------------
 Servo myServo;
 int currentAngle = 0;
+
+// Instantiate LCD using the updated address (0x38)
+LiquidCrystal_I2C lcd(LCD_ADDRESS, LCD_COLS, LCD_ROWS);
 
 char line[256];                     
 size_t lineLen = 0;
@@ -71,6 +76,13 @@ void fillDistanceReading(JsonObject o) {
   o["distance_cm"] = distance_cm;
 }
 
+// ---------------- push button ----------------
+void fillButtonReading(JsonObject o) {
+  // LOW = pressed due to INPUT_PULLUP
+  bool pressed = (digitalRead(BUTTON_PIN) == LOW);
+  o["pressed"] = pressed;
+}
+
 // ---------------- request handling ----------------
 void handleRequest(const char* text, size_t len) {
   JsonDocument req;
@@ -104,6 +116,32 @@ void handleRequest(const char* text, size_t len) {
   } else if (cmd == "distance") {
     fillDistanceReading(data);
 
+  } else if (cmd == "button") {
+    fillButtonReading(data);
+
+  } else if (cmd == "lcd_text") {
+    int row = req["row"] | 0;
+    String msg = req["text"] | "";
+    if (row >= 0 && row < LCD_ROWS) {
+      lcd.setCursor(0, row);
+      lcd.print("                "); // clear row
+      lcd.setCursor(0, row);
+      lcd.print(msg);
+      data["row"] = row;
+      data["text"] = msg;
+    } else {
+      ok = false;
+      error = "row must be 0 or 1";
+    }
+
+  } else if (cmd == "lcd_clear") {
+    lcd.clear();
+
+  } else if (cmd == "lcd_backlight") {
+    bool on = req["on"] | true;
+    if (on) lcd.backlight(); else lcd.noBacklight();
+    data["backlight"] = on;
+
   } else if (cmd == "ping") {
     data["uptime_s"] = millis() / 1000.0;
 
@@ -136,12 +174,22 @@ void setup() {
   Serial.begin(SERIAL_BAUD);
   delay(100);
 
+  // Initialize I2C bus for LCD (Feather V2 native pins)
+  Wire.begin(LCD_SDA, LCD_SCL);
+
+  // Initialize LCD display
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("ESP32 Ready");
+
   myServo.attach(MOTOR_PIN);
   setServoAngle(0); 
 
   pinMode(RAIN_DIGITAL_PIN, INPUT);
   pinMode(ULTRASONIC_TRIG_PIN, OUTPUT);
   pinMode(ULTRASONIC_ECHO_PIN, INPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
   
   analogReadResolution(12);
 
