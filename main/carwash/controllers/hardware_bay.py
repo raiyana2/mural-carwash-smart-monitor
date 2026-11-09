@@ -61,7 +61,7 @@ from carwash.config import (
     VEHICLE_PRESENT_CM,
 )
 from carwash.controllers.errors import ControllerError
-from carwash.controllers.pricing import price_for_seconds
+from carwash.controllers.pricing import price_after_adding, price_for_seconds
 from carwash.hardware.esp32_link import Esp32ConnectError, Esp32Error, Esp32Link, MotorStatus, list_serial_ports
 from carwash.storage.database import MonitorDatabase
 
@@ -573,7 +573,7 @@ class HardwareBay:
         if not link.has("extend"):
             raise ControllerError(
                 "This ESP32 firmware can't add time to a wash. Upload the current firmware.", "conflict")
-        price = price_for_seconds(bay, active["granted_seconds"] + seconds)
+        price = price_after_adding(bay, active, seconds)
         try:
             motor = link.motor_add(seconds, label=self.wash_label(price))
         except Esp32Error as exc:

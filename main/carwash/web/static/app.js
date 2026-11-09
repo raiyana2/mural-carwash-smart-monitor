@@ -422,6 +422,67 @@ function updateOperations(data) {
 }
 
 // ---------------------------------------------------------------- Bay Manager
+// The per-minute price a bay charges. Bays on a flat rate charge the same for the first
+// minute as for each one after it; anything else is shown as "custom".
+function perMinuteCents(bay) {
+  return bay.additional_price_per_minute_cents;
+}
+function isFlatRate(bay) {
+  return bay.base_price_cents === bay.additional_price_per_minute_cents && bay.included_seconds === 60;
+}
+
+// The price most bays charge, to fill the box when "All bays" is picked.
+function commonPerMinute(bays) {
+  const tally = {};
+  for (const bay of bays) tally[perMinuteCents(bay)] = (tally[perMinuteCents(bay)] || 0) + 1;
+  return Number(Object.entries(tally).sort((a, b) => b[1] - a[1])[0]?.[0] ?? 100);
+}
+
+function priceSummary(bays) {
+  const common = commonPerMinute(bays);
+  const others = bays.filter(bay => perMinuteCents(bay) !== common);
+  const custom = bays.filter(bay => !isFlatRate(bay)).map(bay => bay.label);
+  let text = !others.length
+    ? `Every bay charges ${money(common)} a minute.`
+    : `${others.length * 2 < bays.length ? "Most bays" : "Other bays"} charge ${money(common)} a minute; ${others.map(b => `${b.label}: ${money(perMinuteCents(b))}`).join(", ")}.`;
+  if (custom.length) text += ` ${custom.join(", ")} also ${custom.length === 1 ? "has" : "have"} a different first-minute price; saving here makes it a flat rate.`;
+  return text + " Washes already running keep the price they started at.";
+}
+
+function pricePanel(bays) {
+  const cents = commonPerMinute(bays);
+  return `<form class="surface-panel price-panel" data-form="price">
+    <div class="price-panel-copy"><p class="eyebrow">PRICING</p><h2>Price per minute</h2><p class="panel-copy" data-field="price-summary">${escapeHTML(priceSummary(bays))}</p></div>
+    <div class="price-panel-fields">
+      <label>Price<span class="input-suffix"><span>$</span><input name="price" type="number" inputmode="decimal" min="0.01" max="100" step="0.01" value="${(cents / 100).toFixed(2)}" required aria-label="Price per minute in dollars"><span>/min</span></span></label>
+      <label>Apply to<select name="bay" aria-label="Which bays the price applies to"><option value="">All bays</option>${bays.map(b => `<option value="${b.bay_number}">${escapeHTML(b.label)}</option>`).join("")}</select></label>
+      <button type="submit" class="button button-primary" data-field="save-price">Save price</button>
+    </div>
+  </form>`;
+}
+
+async function savePrice(form) {
+  const dollars = Number(form.elements.price.value);
+  const cents = Math.round(dollars * 100);
+  if (!Number.isFinite(dollars) || cents < 1 || cents > 10000) {
+    throw new Error("Enter a price per minute from $0.01 to $100.00.");
+  }
+  const bayNumber = form.elements.bay.value ? Number(form.elements.bay.value) : null;
+  const button = field(form, "save-price");
+  button.disabled = true;
+  try {
+    await api("/api/pricing/per-minute", {
+      method: "PUT", body: JSON.stringify({ price_per_minute_cents: cents, bay_number: bayNumber }),
+    });
+    const where = bayNumber ? latest.bays.find(b => b.bay_number === bayNumber).label : "All bays";
+    form.elements.price.value = (cents / 100).toFixed(2);
+    showNotice(`${where}: price set to ${money(cents)} a minute.`);
+  } finally {
+    button.disabled = false;
+    await refreshNow();
+  }
+}
+
 function bayCard(bay) {
   const n = bay.bay_number;
   const minutes = Math.min(washMinutes[n] || DEFAULT_WASH_MINUTES, maxWashMinutes(bay));
@@ -523,7 +584,8 @@ function bayExtraHTML(bay) {
 function mountBays(data, params) {
   pageContext.textContent = "Bay Manager";
   app.innerHTML = `
-    <div class="page-heading"><div><p class="eyebrow">BAY MANAGER <span class="heading-dot"></span> WASH CONTROL</p><h1>Bay Manager</h1><p class="subheading">Choose a wash time and press <b>Start wash</b>: the bay's valve opens (the servo turns to 180°), stays open for the time paid for, then closes. Default price: $1.00 a minute, up to 60 minutes.</p></div><span class="demo-banner">Bay 1 hardware · Bays 2–11 simulated</span></div>
+    <div class="page-heading"><div><p class="eyebrow">BAY MANAGER <span class="heading-dot"></span> WASH CONTROL</p><h1>Bay Manager</h1><p class="subheading">Choose a wash time and press <b>Start wash</b>: the bay's valve opens (the servo turns to 180°), stays open for the time paid for, then closes. Set what a minute costs under <b>Price per minute</b>; washes can run up to 60 minutes.</p></div><span class="demo-banner">Bay 1 hardware · Bays 2–11 simulated</span></div>
+    ${pricePanel(data.bays)}
     <div class="bay-cards">${data.bays.map(bayCard).join("")}</div>
     <p class="helper-text">Bay 1's timer runs on the ESP32 itself, so its valve still closes on time if this page, the computer, or the USB cable drops.</p>`;
   updateBays(data);
@@ -538,6 +600,7 @@ function mountBays(data, params) {
 }
 
 function updateBays(data) {
+  setText(field(app, "price-summary"), priceSummary(data.bays));
   for (const bay of data.bays) {
     const card = app.querySelector(`[data-card="${bay.bay_number}"]`);
     if (!card) continue;
@@ -916,7 +979,9 @@ async function addMinute(bayNumber) {
   try {
     const detail = await api(`/api/bays/${bayNumber}/add`, { method: "POST", body: JSON.stringify({ seconds: 60 }) });
     const total = detail.active_granted_seconds;
-    showNotice(`${bay.label}: added 1 minute. The wash is now ${Math.round(total / 60)} min (${money(priceFor(bay, total))}).`);
+    const active = (detail.sessions || []).find(s => s.status === "active");
+    const price = active ? active.price_cents : priceFor(bay, total);
+    showNotice(`${bay.label}: added 1 minute. The wash is now ${Math.round(total / 60)} min (${money(price)}).`);
   } finally {
     busyBays.delete(bayNumber);
     await refreshNow();
@@ -1039,10 +1104,20 @@ app.addEventListener("submit", async event => {
   event.preventDefault();
   try {
     if (form.dataset.form === "run") await startWash(form);
+    else if (form.dataset.form === "price") await savePrice(form);
     else if (form.dataset.form === "connect") await connect(form.querySelector('[data-field="connect"]'));
   } catch (error) {
     showNotice(error.message, true);
   }
+});
+
+// Picking a bay in the price panel shows what that bay charges now.
+app.addEventListener("change", event => {
+  const form = event.target.closest('form[data-form="price"]');
+  if (!form || event.target.name !== "bay" || !latest) return;
+  const bay = latest.bays.find(b => b.bay_number === Number(event.target.value));
+  const cents = bay ? perMinuteCents(bay) : commonPerMinute(latest.bays);
+  form.elements.price.value = (cents / 100).toFixed(2);
 });
 
 app.addEventListener("input", event => {

@@ -123,3 +123,5 @@
 .legend-fault{color:#a52f2b}
 .bay-card.bay-card-has-fault{border-color:#e3a19d;border-top-color:var(--danger);background:#fff4f2;box-shadow:inset 4px 0 0 var(--danger)}
 .fault-line{font:600 12px var(--mono);color:#a52f2b;background:#fbe2df;padding:8px 10px;border-radius:3px}.fault-line:empty{display:none}
+.price-panel{display:flex;justify-content:space-between;align-items:end;gap:24px;margin-bottom:24px;border-top:3px solid var(--orange)}.price-panel-copy{min-width:0;max-width:560px}.price-panel-copy .panel-copy{margin-bottom:0}.price-panel-fields{display:grid;grid-template-columns:150px 180px auto;gap:12px;align-items:end;flex-shrink:0}.price-panel-fields label{font-size:12px}.price-panel-fields .input-suffix input{padding-left:0}.price-panel-fields .input-suffix span{white-space:nowrap}
+@media(max-width:900px){.price-panel{flex-direction:column;align-items:stretch}.price-panel-fields{grid-template-columns:1fr 1fr}.price-panel-fields .button{grid-column:1/-1}}

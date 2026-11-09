@@ -34,6 +34,11 @@ class EnabledRequest(BaseModel):
     enabled: bool
 
 
+class PricePerMinuteRequest(BaseModel):
+    price_per_minute_cents: int = Field(ge=1, le=10000)          # $0.01 to $100.00
+    bay_number: Optional[int] = Field(default=None, ge=1, le=BAY_COUNT)   # None = every bay
+
+
 class PreviewRequest(BaseModel):
     bay_number: int = Field(ge=1, le=BAY_COUNT)
     seconds: int = Field(ge=1, le=MAX_MOTOR_SECONDS)

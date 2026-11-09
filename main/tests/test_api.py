@@ -167,3 +167,53 @@ class ControllerErrorApiTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PricePerMinuteApiTests(unittest.TestCase):
+    def test_set_price_per_minute_for_all_bays_and_one_bay(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = MonitorController(
+                database=MonitorDatabase(Path(temp_dir) / "price.sqlite3"),
+                serial_port="/no-such-serial-port",
+                run_simulator=False,
+                seed_demo_data=False,
+            )
+            with patch("carwash.web.app.controller", controller):
+                with TestClient(app) as client:
+                    saved = client.put("/api/pricing/per-minute", json={"price_per_minute_cents": 150})
+                    self.assertEqual(saved.status_code, 200)
+                    self.assertEqual(len(saved.json()["bay_numbers"]), 11)
+                    for bay in client.get("/api/dashboard").json()["bays"]:
+                        self.assertEqual(bay["base_price_cents"], 150)
+                        self.assertEqual(bay["included_seconds"], 60)
+                        self.assertEqual(bay["additional_price_per_minute_cents"], 150)
+
+                    one = client.put("/api/pricing/per-minute",
+                                     json={"price_per_minute_cents": 225, "bay_number": 3})
+                    self.assertEqual(one.json()["bay_numbers"], [3])
+                    preview = client.post("/api/pricing/preview", json={"bay_number": 3, "seconds": 150})
+                    self.assertEqual(preview.json()["price_cents"], 675)   # 3 started minutes
+                    other = client.post("/api/pricing/preview", json={"bay_number": 4, "seconds": 150})
+                    self.assertEqual(other.json()["price_cents"], 450)
+
+                    self.assertEqual(client.put("/api/pricing/per-minute",
+                                                json={"price_per_minute_cents": 0}).status_code, 422)
+                    self.assertEqual(client.put("/api/pricing/per-minute",
+                                                json={"price_per_minute_cents": 100, "bay_number": 99}).status_code, 422)
+
+    def test_price_change_mid_wash_only_applies_to_added_time(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = MonitorController(
+                database=MonitorDatabase(Path(temp_dir) / "midwash.sqlite3"),
+                serial_port="/no-such-serial-port",
+                run_simulator=False,
+                seed_demo_data=False,
+            )
+            with patch("carwash.web.app.controller", controller):
+                with TestClient(app) as client:
+                    client.put("/api/pricing/per-minute", json={"price_per_minute_cents": 100, "bay_number": 2})
+                    client.post("/api/bays/2/start", json={"seconds": 120})
+                    client.put("/api/pricing/per-minute", json={"price_per_minute_cents": 300, "bay_number": 2})
+                    detail = client.post("/api/bays/2/add", json={"seconds": 60}).json()
+                    active = next(s for s in detail["sessions"] if s["status"] == "active")
+                    self.assertEqual(active["price_cents"], 200 + 300)

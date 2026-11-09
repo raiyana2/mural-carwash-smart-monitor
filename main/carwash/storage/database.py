@@ -284,6 +284,20 @@ class MonitorDatabase:
                 ),
             )
 
+    def set_price_per_minute(self, bay_numbers: list[int], price_cents: int) -> None:
+        """Flat per-minute pricing: the first minute costs `price_cents`, and so does each
+        minute (or part of one) after it. Each bay keeps its maximum wash length."""
+        now = time.time()
+        with self.connection() as db:
+            db.executemany(
+                """
+                UPDATE pricing_settings SET base_price_cents = ?, included_seconds = 60,
+                    additional_price_per_minute_cents = ?, updated_at = ?
+                WHERE bay_number = ?
+                """,
+                [(price_cents, price_cents, now, number) for number in bay_numbers],
+            )
+
     def update_bay(self, bay_number: int, values: dict) -> None:
         with self.connection() as db:
             assignments = ", ".join(f"{key} = ?" for key in values)

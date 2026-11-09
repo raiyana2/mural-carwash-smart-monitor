@@ -20,6 +20,7 @@ from carwash.web.schemas import (
     ConnectRequest,
     EnabledRequest,
     PreviewRequest,
+    PricePerMinuteRequest,
     ScenarioRequest,
     ServicedRequest,
     SessionRequest,
@@ -109,6 +110,11 @@ def disconnect_hardware() -> dict:
 @app.post("/api/hardware/ping")
 def ping_hardware() -> dict:
     return controller.ping_hardware()
+
+
+@app.put("/api/pricing/per-minute")
+def set_price_per_minute(request: PricePerMinuteRequest) -> dict:
+    return controller.set_price_per_minute(request.price_per_minute_cents, request.bay_number)
 
 
 @app.post("/api/pricing/preview")

@@ -29,7 +29,7 @@ from carwash.config import (
 from carwash.controllers.errors import ControllerError
 from carwash.controllers.hardware_bay import HardwareBay
 from carwash.controllers.maintenance import EQUIPMENT, MaintenanceAnalyzer
-from carwash.controllers.pricing import price_for_seconds
+from carwash.controllers.pricing import price_after_adding, price_for_seconds
 from carwash.controllers.simulator import Simulator
 from carwash.storage.database import MonitorDatabase
 
@@ -235,8 +235,7 @@ class MonitorController:
             if bay["source"] == "hardware":
                 self.hardware.extend_run_locked(bay, active, seconds)
             else:
-                self.database.extend_session(bay_number, seconds,
-                                             price_for_seconds(bay, active["granted_seconds"] + seconds))
+                self.database.extend_session(bay_number, seconds, price_after_adding(bay, active, seconds))
             return self.bay_detail(bay_number)
 
     def stop_session(self, bay_number: int) -> dict:
@@ -263,6 +262,20 @@ class MonitorController:
                 raise ControllerError("End the active wash before disabling this bay", "conflict")
             self.database.update_settings(bay_number, {**values, "enabled": int(values["enabled"])})
             return self.bay_detail(bay_number)
+
+    def set_price_per_minute(self, price_cents: int, bay_number: Optional[int] = None) -> dict:
+        """Charge a flat `price_cents` per minute (the first minute included) on one bay,
+        or on every bay when `bay_number` is None. Washes already running keep the price
+        they started at; Bay 1's LCD picks up the new price on its next poll."""
+        if price_cents < 1:
+            raise ControllerError("The price per minute must be at least $0.01", "invalid")
+        with self._lock:
+            if bay_number is None:
+                numbers = [bay["bay_number"] for bay in self.database.list_bays()]
+            else:
+                numbers = [self._get_bay(bay_number)["bay_number"]]
+            self.database.set_price_per_minute(numbers, price_cents)
+            return {"price_per_minute_cents": price_cents, "bay_numbers": numbers}
 
     def set_enabled(self, bay_number: int, enabled: bool) -> dict:
         """Put a bay in or out of service."""
