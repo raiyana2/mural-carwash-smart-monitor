@@ -150,6 +150,10 @@ class MaintenanceAnalyzer:
         if no_feedback:
             return {**result, "status": "down", "days_until": 0,
                     "prediction": "The valve was told to open but didn't respond. Repair now."}
+        leaking = any(f["active"] and f["fault_type"] == "water_while_idle" for f in bay.get("faults", []))
+        if leaking:
+            return {**result, "status": "failing", "days_until": 0,
+                    "prediction": "Water is flowing while the valve is closed: it may be stuck open or leaking."}
         if remaining <= 0:
             return {**result, "status": "soon", "days_until": 0, "prediction": "Service due now."}
         if per_day <= 0:
@@ -241,6 +245,6 @@ class MaintenanceAnalyzer:
 
     def mark_serviced(self, bay_number: int, equipment: str) -> None:
         self.database.mark_serviced(bay_number, equipment)
-        for fault_type in {"water": ("flow_low", "flow_none"), "valve": ("valve_service_due",),
+        for fault_type in {"water": ("flow_low", "flow_none"), "valve": ("valve_service_due", "water_while_idle"),
                            "counter": ()}[equipment]:
             self.database.resolve_faults(bay_number, fault_type)

@@ -13,7 +13,7 @@ Bay 1's parts stand in for real car wash equipment:
 | Servo | The bay's water valve. Open (180°) = the bay is **active**; closed (0°) = idle. |
 | Rain sensor | A water flow meter: fully wet = 10 L/min. Low flow means the pump or nozzle may be failing; none means it isn't working. |
 | Ultrasonic sensor | A car counter: each car that pulls into the bay is counted once. |
-| Button | The coin slot: each press buys one minute. |
+| Button | The coin slot: each press buys one minute, starting a wash or adding a minute to the one running. |
 | LCD | The price ($1.00 per minute, up to 60 minutes), then during a wash the price paid and the time left. |
 
 - Bays 2–11 are explicitly labelled local simulator bays, with 30 days of simulated history so the reports and repair predictions have data from the start.
@@ -59,6 +59,7 @@ Every message is one JSON object per line, at 115200 baud. Each request has an `
 | `{"id":1,"cmd":"motor_on","seconds":5}` | **Timed run:** go to `SERVO_ACTIVE_ANGLE` (180°), hold 5 s, then back to the angle it was at before | `{"angle":180,"running":true,"remaining_s":5.0}` |
 | `{"id":2,"cmd":"motor_on","seconds":5,"angle":90}` | Timed run at 90° | |
 | `{"id":2,"cmd":"motor_on","seconds":300,"label":"Wash $5.00"}` | Timed run with LCD line 1 set to `label` (16 characters) for the run; the dashboard sends the price paid | |
+| `{"id":3,"cmd":"motor_add","seconds":60,"label":"Wash $6.00"}` | Add 60 s to the run in progress; the servo stays put and `label` (optional) replaces LCD line 1 | same as `motor_on` |
 | `{"id":3,"cmd":"motor_off"}` | End a timed run now, back to the angle it was at before | |
 | `{"id":4,"cmd":"motor_status"}` | Is a run in progress, time left, angle | same as `motor_on` |
 | `{"id":5,"cmd":"servo_set","angle":90}` | Move to 90° and **stay there** | `{"angle":90,"running":false,"remaining_s":0}` |
@@ -69,11 +70,12 @@ Every message is one JSON object per line, at 115200 baud. Each request has an `
 | `{"id":10,"cmd":"lcd_text","row":0,"text":"Hello"}` | Set LCD row 0 or 1 (cut to 16 characters) | `{"row":0,"text":"Hello"}` |
 | `{"id":11,"cmd":"lcd_clear"}` | Blank the LCD | |
 | `{"id":12,"cmd":"lcd_backlight","on":false}` | LCD backlight on or off | `{"backlight":false}` |
-| `{"id":13,"cmd":"ping"}` | Check the ESP32 is alive, and what this firmware has | `{"uptime_s":42.0,"firmware":"motor_rain_controller","version":2,"features":["motor","rain","distance","button","lcd"]}` |
+| `{"id":13,"cmd":"ping"}` | Check the ESP32 is alive, and what this firmware has | `{"uptime_s":42.0,"firmware":"motor_rain_controller","version":3,"features":["motor","extend","rain","distance","button","lcd"]}` |
 
 Refusals (`ok:false`):
 - angle not 0–180
-- `seconds` not between 0 and 3600
+- `seconds` not between 0 and 3600 (for `motor_add`: the time left would go over 3600 s)
+- `motor_add` with no run in progress ("no run in progress")
 - `motor_on` while a run is already in progress ("motor already running")
 - `servo_set` during a timed run ("timed hold running; send motor_off first")
 - `lcd_text` with a row other than 0 or 1
@@ -81,7 +83,7 @@ Refusals (`ok:false`):
 Events the ESP32 sends on its own:
 - `{"type":"event","event":"ready"}` after boot
 - `{"type":"event","event":"servo","angle":90,"running":false}` on every angle change
-- `{"type":"event","event":"motor","running":true,"reason":"started","angle":180}`, and later `"running":false` with `"reason":"timer"` or `"stopped"`
+- `{"type":"event","event":"motor","running":true,"reason":"started","angle":180}` (`"reason":"extended"` after `motor_add`), and later `"running":false` with `"reason":"timer"` or `"stopped"`
 - `{"type":"event","event":"button","pressed":true}` each time the button is pressed (debounced)
 
 The timed run's timer runs on the ESP32, so the servo returns to its original angle on time even if the computer crashes or the USB cable is pulled. During a run the LCD shows the run's `label` (or "Motor running" without one) on line 1 and counts down the time left on line 2 by itself, e.g. "Wash $5.00 / 4:59 left"; when the run ends it goes back to the text last set with `lcd_text`.

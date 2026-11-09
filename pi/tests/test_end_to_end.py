@@ -58,8 +58,8 @@ class FakeEsp32EndToEndTests(unittest.TestCase):
     def test_link_reads_the_new_sensors_and_lcd(self):
         events = []
         with esp32_link.Esp32Link(self.port, on_event=events.append) as esp:
-            self.assertEqual(esp.features, {"motor", "rain", "distance", "button", "lcd"})
-            self.assertEqual(esp.firmware_version, 2)
+            self.assertEqual(esp.features, {"motor", "extend", "rain", "distance", "button", "lcd"})
+            self.assertEqual(esp.firmware_version, 3)
             self.assertGreater(esp.read_distance(), 0)
             self.assertFalse(esp.read_button())
             self.assertEqual(esp.lcd_text(0, "a line much longer than sixteen"), "a line much long")

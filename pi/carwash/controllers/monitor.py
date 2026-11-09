@@ -95,11 +95,20 @@ class MonitorController:
             self._wake.clear()
 
     def _on_button_press(self) -> None:
-        """Bay 1's physical button: start a run, unless the bay can't run right now.
+        """Bay 1's physical button: like a coin, each press buys BUTTON_RUN_SECONDS. It
+        starts a wash, or adds the time to the wash in progress.
         Called by HardwareBay.poll_locked() with the lock held."""
+        def length(seconds: int) -> str:
+            minutes, rest = divmod(seconds, 60)
+            return f"{seconds} s" if not minutes else f"{minutes} min" if not rest else f"{minutes}:{rest:02d}"
         try:
-            self.start_session(HARDWARE_BAY, BUTTON_RUN_SECONDS)
-            result = f"Started a {BUTTON_RUN_SECONDS} s run"
+            bay = self._get_bay(HARDWARE_BAY)
+            if any(session["status"] == "active" for session in bay["sessions"]):
+                detail = self.add_time(HARDWARE_BAY, BUTTON_RUN_SECONDS)
+                result = f"Added {length(BUTTON_RUN_SECONDS)} (wash now {length(detail['active_granted_seconds'])})"
+            else:
+                self.start_session(HARDWARE_BAY, BUTTON_RUN_SECONDS)
+                result = f"Started a {length(BUTTON_RUN_SECONDS)} wash"
         except ControllerError as exc:
             result = f"Ignored: {exc}"
         self.hardware.last_button_result = result
@@ -122,12 +131,14 @@ class MonitorController:
         midnight = time.mktime(time.localtime(now)[:3] + (0, 0, 0, 0, 0, -1))
         cars_today = self.database.count_readings_by_bay("car", midnight)
         last_flow = self.database.latest_reading_by_bay("flow")
+        open_faults = self.database.open_faults_by_bay()
         result["hardware"] = hardware
         result["bays"] = [self._decorate(bay, hardware, now) for bay in result["bays"]]
         for bay in result["bays"]:
             bay["cars_today"] = cars_today.get(bay["bay_number"], 0)
             flow = last_flow.get(bay["bay_number"])
             bay["last_wash_flow_lpm"] = flow["value"] if flow else None
+            bay["open_faults"] = open_faults.get(bay["bay_number"], [])
         result["motor_run_angle"] = MOTOR_RUN_ANGLE
         result["motor_rest_angle"] = MOTOR_REST_ANGLE
         return result
@@ -208,6 +219,25 @@ class MonitorController:
             else:
                 session_id = self.simulator.start_run(bay, seconds, wash_mode)
             return {"session_id": session_id, **self.bay_detail(bay_number)}
+
+    def add_time(self, bay_number: int, seconds: int) -> dict:
+        """Add `seconds` to the wash in progress (and to its price)."""
+        with self._lock:
+            bay = self._get_bay(bay_number)
+            active = next((s for s in bay["sessions"] if s["status"] == "active"), None)
+            if active is None:
+                raise ControllerError(f"{bay['label']} isn't washing. Start a wash first.", "conflict")
+            limit = min(bay["maximum_duration_seconds"], MAX_MOTOR_SECONDS)
+            if active["granted_seconds"] + seconds > limit:
+                raise ControllerError(
+                    f"A wash can be at most {limit // 60} minutes; {bay['label']}'s is already "
+                    f"{active['granted_seconds'] // 60} minutes.", "conflict")
+            if bay["source"] == "hardware":
+                self.hardware.extend_run_locked(bay, active, seconds)
+            else:
+                self.database.extend_session(bay_number, seconds,
+                                             price_for_seconds(bay, active["granted_seconds"] + seconds))
+            return self.bay_detail(bay_number)
 
     def stop_session(self, bay_number: int) -> dict:
         """Turn a bay's motor back to 0° now."""

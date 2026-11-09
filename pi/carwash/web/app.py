@@ -16,6 +16,7 @@ from fastapi.staticfiles import StaticFiles
 
 from carwash.controllers import ControllerError, MonitorController
 from carwash.web.schemas import (
+    AddTimeRequest,
     ConnectRequest,
     EnabledRequest,
     PreviewRequest,
@@ -78,6 +79,11 @@ def set_enabled(bay_number: int, request: EnabledRequest) -> dict:
 @app.post("/api/bays/{bay_number}/start")
 def start_session(bay_number: int, request: SessionRequest) -> dict:
     return controller.start_session(bay_number, request.seconds, request.wash_mode)
+
+
+@app.post("/api/bays/{bay_number}/add")
+def add_time(bay_number: int, request: AddTimeRequest) -> dict:
+    return controller.add_time(bay_number, request.seconds)
 
 
 @app.post("/api/bays/{bay_number}/stop")

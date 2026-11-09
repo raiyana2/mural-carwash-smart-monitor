@@ -5,7 +5,7 @@ import time
 import unittest
 from pathlib import Path
 
-from carwash.config import FLOW_CHECK_SECONDS, MAX_MOTOR_SECONDS
+from carwash.config import BUTTON_RUN_SECONDS, FLOW_CHECK_SECONDS, MAX_MOTOR_SECONDS
 from carwash.controllers import ControllerError, MonitorController
 from carwash.controllers.pricing import price_for_seconds
 from carwash.storage.database import MonitorDatabase
@@ -39,6 +39,49 @@ class PricingTests(unittest.TestCase):
             self.assertEqual(database.get_bay(3)["maximum_duration_seconds"], 3600)
             self.assertEqual(database.get_bay(4)["base_price_cents"], 650)
 
+    def test_button_starts_a_wash_then_adds_a_minute_each_press(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            link = StubLink()
+            controller = connected_controller(temp_dir, link)
+            with controller._lock:
+                controller._on_button_press()                 # starts a 1-minute wash
+                controller._on_button_press()                 # adds a minute
+                controller._on_button_press()                 # and another
+            session = controller.database.get_bay(1)["sessions"][0]
+            total = 3 * BUTTON_RUN_SECONDS                    # BUTTON_RUN_SECONDS per press
+            price = price_for_seconds(controller.database.get_bay(1), total)
+            self.assertEqual((session["granted_seconds"], session["price_cents"]), (total, price))
+            self.assertEqual([c[0] for c in link.calls if c[0].startswith("motor_")],
+                             ["motor_on", "motor_add", "motor_add"])
+            self.assertEqual(link.last_label, f"Wash ${price / 100:.2f}")
+            self.assertIn("Added", controller.hardware.last_button_result)
+
+    def test_adding_time_stops_at_the_hour_and_needs_new_firmware(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = connected_controller(temp_dir, StubLink())
+            controller.start_session(1, 3570)
+            with self.assertRaises(ControllerError):
+                controller.add_time(1, 60)                    # would be over 60 minutes
+            controller.stop_session(1)
+            with self.assertRaises(ControllerError):
+                controller.add_time(1, 60)                    # nothing running
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = connected_controller(temp_dir, StubLink(features={"motor", "rain", "button"}))
+            controller.start_session(1, 60)
+            with self.assertRaises(ControllerError):
+                controller.add_time(1, 60)                    # old firmware has no motor_add
+
+    def test_simulated_bays_can_have_time_added(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = connected_controller(temp_dir, StubLink())
+            client = api_client(self, controller)
+            client.post("/api/bays/3/stop")
+            self.assertEqual(client.post("/api/bays/3/start", json={"seconds": 120}).status_code, 200)
+            added = client.post("/api/bays/3/add", json={"seconds": 60})
+            self.assertEqual(added.status_code, 200)
+            self.assertEqual(added.json()["active_granted_seconds"], 180)
+            self.assertEqual(client.post("/api/bays/4/add", json={"seconds": 60}).status_code, 409)
+
     def test_lcd_shows_the_price_paid_during_a_wash(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             link = StubLink()
@@ -61,13 +104,91 @@ class Bay1SensorHistoryTests(unittest.TestCase):
             self.hw._next_rain_at = 0
             self.hw.poll_locked()
 
-    def test_ultrasonic_counts_each_car_once(self):
-        # car arrives (2 readings to confirm), stays, one missed reading, leaves, next car
-        for distance in (200, 30, 25, 28, 200, 27, 30, 200, 200, 200, 40, 35, 35):
+    def cars(self):
+        return len(self.controller.database.readings(1, "car"))
+
+    def test_a_car_is_only_counted_during_a_wash_within_30_cm(self):
+        for distance in (20.0, 20.0, 20.0):           # a car in front, but no wash: not counted
             self.link.distance_cm = distance
             self.poll()
-        self.assertEqual(len(self.controller.database.readings(1, "car")), 2)
-        self.assertEqual(self.controller.dashboard()["bays"][0]["cars_today"], 2)
+        self.assertEqual(self.cars(), 0)
+        self.controller.start_session(1, 600)
+        for distance in (35.0, 31.0, 31.0):           # wash running, but further than 30 cm
+            self.link.distance_cm = distance
+            self.poll()
+        self.assertEqual(self.cars(), 0)
+        for distance in (30.0, 18.0, 18.0, 22.0):     # within 30 cm: counted once
+            self.link.distance_cm = distance
+            self.poll()
+        self.assertEqual(self.cars(), 1)
+        self.assertEqual(self.controller.dashboard()["bays"][0]["cars_today"], 1)
+        self.assertTrue(self.link.running)
+
+    def test_wash_ends_when_the_car_leaves(self):
+        self.controller.start_session(1, 600)
+        for distance in (20.0, 20.0, 45.0):           # counted, then one reading further away
+            self.link.distance_cm = distance
+            self.poll()
+        self.assertTrue(self.link.running)            # one reading isn't enough
+        self.link.distance_cm = None                  # out of range: gone
+        self.poll()
+        self.assertFalse(self.link.running)
+        self.assertEqual(self.controller.bay_detail(1)["status"], "available")
+        self.assertIsNotNone(self.controller.dashboard()["hardware"]["last_car_left_at"])
+        self.assertEqual(self.cars(), 1)
+
+    def test_a_wash_with_no_car_does_not_end_early(self):
+        self.link.distance_cm = None
+        self.controller.start_session(1, 600)
+        for _ in range(4):
+            self.poll()
+        self.assertTrue(self.link.running)
+        for distance in (25.0, 25.0, 200.0, 25.0, 25.0):   # car arrives; one bad reading
+            self.link.distance_cm = distance
+            self.poll()
+        self.assertTrue(self.link.running)
+        self.assertEqual(self.cars(), 1)
+
+    def idle_water_faults(self):
+        return [f for f in self.controller.database.recent_faults(20)
+                if f["active"] and f["fault_type"] == "water_while_idle"]
+
+    def test_water_while_the_valve_is_closed_raises_an_alert(self):
+        self.link.rain_wet = 0.0
+        self.poll()
+        self.link.rain_wet = 60.0                  # 6 L/min with no wash running
+        self.poll()
+        self.assertEqual(self.idle_water_faults(), [])       # not straight away
+        self.hw._idle_wet_since -= 11
+        self.poll()
+        faults = self.idle_water_faults()
+        self.assertEqual(len(faults), 1)
+        self.assertIn("valve may be stuck open or leaking", faults[0]["explanation"])
+        valve = self.controller.maintenance.valve(self.controller.database.get_bay(1))
+        self.assertEqual(valve["status"], "failing")
+        self.assertNotEqual(self.controller.bay_detail(1)["status"], "faulted")   # an alert, not a lock-out
+        self.link.rain_wet = 0.0                   # dry again: clears after a while
+        self.poll()
+        self.assertEqual(len(self.idle_water_faults()), 1)
+        self.hw._idle_dry_since -= 11
+        self.poll()
+        self.assertEqual(self.idle_water_faults(), [])
+
+    def test_water_during_and_just_after_a_wash_is_not_a_leak(self):
+        self.link.rain_wet = 70.0
+        self.controller.start_session(1, 60)
+        self.poll()
+        self.hw._idle_wet_since = time.time() - 60     # would trip if it were checked
+        self.poll()
+        self.link.motor_off()                      # wash over; the plate is still wet
+        self.poll()
+        self.poll()
+        self.assertEqual(self.idle_water_faults(), [])
+        self.hw._wash_ended_at -= 31               # grace period over, still wet
+        self.poll()
+        self.hw._idle_wet_since -= 11
+        self.poll()
+        self.assertEqual(len(self.idle_water_faults()), 1)
 
     def test_wash_records_its_average_water_flow(self):
         self.link.rain_wet = 80.0
@@ -144,6 +265,11 @@ class SimulatedHistoryTests(unittest.TestCase):
         self.assertIn((5, "flow_low"), active)
         self.assertIn((7, "valve_service_due"), active)
         self.assertNotIn((3, "flow_low"), active)
+
+    def test_dashboard_lists_each_bays_open_faults(self):
+        bays = {b["bay_number"]: b for b in self.controller.dashboard()["bays"]}
+        self.assertIn("flow_none", [f["fault_type"] for f in bays[10]["open_faults"]])
+        self.assertEqual(bays[3]["open_faults"], [])
 
     def test_financial_report_adds_up(self):
         report = self.controller.financial_report(30)

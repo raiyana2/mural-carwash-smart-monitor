@@ -332,6 +332,21 @@ class MonitorDatabase:
             )
             return int(cursor.lastrowid)
 
+    def extend_session(self, bay_number: int, seconds: int, price_cents: int) -> Optional[int]:
+        """Add `seconds` to the bay's active session and set its new total price."""
+        with self.connection() as db:
+            row = db.execute(
+                "SELECT id FROM sessions WHERE bay_number = ? AND status = 'active'", (bay_number,)
+            ).fetchone()
+            if row is None:
+                return None
+            db.execute(
+                "UPDATE sessions SET purchased_seconds = purchased_seconds + ?, "
+                "granted_seconds = granted_seconds + ?, price_cents = ? WHERE id = ?",
+                (seconds, seconds, price_cents, row["id"]),
+            )
+            return int(row["id"])
+
     def end_session(self, bay_number: int, status: str = "completed") -> Optional[int]:
         now = time.time()
         with self.connection() as db:
@@ -466,6 +481,17 @@ class MonitorDatabase:
                 (bay_number, bay_number),
             )
             return bay_number
+
+    def open_faults_by_bay(self) -> dict[int, list[dict]]:
+        """Every open fault's type and severity, by bay, newest first."""
+        result: dict[int, list[dict]] = {}
+        with self.connection() as db:
+            for row in db.execute(
+                "SELECT bay_number, fault_type, severity FROM faults WHERE active = 1 ORDER BY created_at DESC"
+            ):
+                result.setdefault(row["bay_number"], []).append(
+                    {"fault_type": row["fault_type"], "severity": row["severity"]})
+        return result
 
     def recent_faults(self, limit: int = 8) -> list[dict]:
         with self.connection() as db:

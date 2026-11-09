@@ -9,11 +9,14 @@ and the ESP32 turns it back on its own timer, even if the Pi or the cable drops.
 
 The rain sensor stands in for a water flow meter: while the valve is open its readings
 are collected, a wash with no water raises an alert FLOW_CHECK_SECONDS in, and each
-wash's average flow is saved for the repair predictions (maintenance.py).
+wash's average flow is saved for the repair predictions (maintenance.py). While the
+valve is closed it should read dry: water then means the valve is stuck open or leaking,
+which raises a "water while idle" alert.
 
 With firmware that has them (it lists its features when pinged), HardwareBay also:
   * reads the ultrasonic sensor every DISTANCE_POLL_SECONDS: it shows whether a car is
-    in the bay, and counts each car that pulls in
+    in the bay (within VEHICLE_PRESENT_CM); during a wash it counts the car, and ends the
+    wash once that car has gone (further than VEHICLE_PRESENT_CM, or out of range)
   * hands each press of the bay's button to on_button (MonitorController starts a wash)
   * keeps the bay's LCD showing the price and longest wash, or that the bay is out of
     service; during a wash the firmware shows the price paid and counts down the time
@@ -35,13 +38,18 @@ import serial
 from carwash.config import (
     BUTTON_RUN_SECONDS,
     CAR_CONFIRM_POLLS,
+    CAR_LEFT_POLLS,
     DISTANCE_POLL_SECONDS,
     DISTANCE_STALE_SECONDS,
+    END_WASH_WHEN_CAR_LEAVES,
     ESP32_PORT,
     FLOW_CHECK_SECONDS,
     FLOW_FULL_SCALE_LPM,
     FLOW_NONE_LPM,
     FLOW_SETTLE_SECONDS,
+    IDLE_WATER_GRACE_SECONDS,
+    IDLE_WATER_LPM,
+    IDLE_WATER_SECONDS,
     HARDWARE_BAY,
     HARDWARE_STALE_SECONDS,
     MOTOR_REST_ANGLE,
@@ -94,14 +102,15 @@ class HardwareBay:
         self._esp_restarted = False           # set by the serial reader thread on a "ready" event
         self._next_distance_at = 0.0
         self._lcd_shown: Optional[tuple[str, str]] = None   # the LCD text last sent
-        # Car counter: a car counts once it has been in range for CAR_CONFIRM_POLLS
-        # readings, and the next car can count once it's been gone that long.
-        self._car_seen = 0
-        self._car_gone = 0
-        self._car_counted = False
         # The wash in progress (valve open): when it started, its flow readings, and
         # whether the no-water alert has been raised.
         self._wash: Optional[dict] = None
+        self.last_car_left_at: Optional[float] = None    # when a wash last ended because the car left
+        # Water while idle: when the sensor turned wet (or dry again) with the valve closed,
+        # and when the last wash ended (the sensor is ignored for a while after).
+        self._idle_wet_since: Optional[float] = None
+        self._idle_dry_since: Optional[float] = None
+        self._wash_ended_at: Optional[float] = None
         # Button presses: the reader thread sets _button_pending and calls wake();
         # poll_locked() then calls on_button() under the lock.
         self.on_button: Optional[Callable[[], None]] = None   # set by MonitorController
@@ -184,8 +193,6 @@ class HardwareBay:
         self._next_distance_at = 0.0
         self._lcd_shown = None
         self._button_pending = False
-        self._car_seen = self._car_gone = 0
-        self._car_counted = False
         self._wash = None
         self._servo_angle = link.angle
         self.database.resolve_faults(self.bay_number, "serial_connection_lost")
@@ -280,12 +287,11 @@ class HardwareBay:
             self._connection_lost_locked(exc)
             return
         if distance_read:
-            self._count_car_locked(distance)
             self.database.update_bay(
                 self.bay_number,
                 {
                     # No echo means nothing within range, so no car.
-                    "vehicle_present": int(distance is not None and distance < VEHICLE_PRESENT_CM),
+                    "vehicle_present": int(distance is not None and distance <= VEHICLE_PRESENT_CM),
                     "distance_cm": distance,
                     "distance_updated_at": time.time(),
                 },
@@ -302,7 +308,11 @@ class HardwareBay:
             )
         self._record_motor_locked(motor)
         if reading is not None:
-            self._flow_sample_locked(reading.wet_percent / 100 * FLOW_FULL_SCALE_LPM)
+            flow = reading.wet_percent / 100 * FLOW_FULL_SCALE_LPM
+            self._flow_sample_locked(flow)
+            self._check_idle_water_locked(flow, motor.running)
+        if distance_read:
+            self._track_car_locked(distance)
         if self._button_pending:
             self._button_pending = False
             if self.on_button:
@@ -312,18 +322,38 @@ class HardwareBay:
     # ------------------------------------------------------------------
     # car counter and water flow
     # ------------------------------------------------------------------
-    def _count_car_locked(self, distance: Optional[float]) -> None:
-        if distance is not None and distance < VEHICLE_PRESENT_CM:
-            self._car_gone = 0
-            self._car_seen += 1
-            if self._car_seen >= CAR_CONFIRM_POLLS and not self._car_counted:
-                self._car_counted = True
+    def _track_car_locked(self, distance: Optional[float]) -> None:
+        """During a wash: count the car, and end the wash when it leaves.
+
+        A car is counted once per wash, when something is within VEHICLE_PRESENT_CM for
+        CAR_CONFIRM_POLLS readings in a row while the valve is open. Once a car has been
+        counted, CAR_LEFT_POLLS readings in a row further than that (or no echo, meaning
+        nothing in range) end the wash. A wash with no car never ends early."""
+        wash = self._wash
+        if wash is None:
+            return
+        present = distance is not None and distance <= VEHICLE_PRESENT_CM
+        if present:
+            wash["car_away"] = 0
+            wash["car_seen"] = wash.get("car_seen", 0) + 1
+            if not wash.get("car_counted") and wash["car_seen"] >= CAR_CONFIRM_POLLS:
+                wash["car_counted"] = True
                 self.database.add_reading(self.bay_number, "car", 1, self._link_source)
-        else:
-            self._car_seen = 0
-            self._car_gone += 1
-            if self._car_gone >= CAR_CONFIRM_POLLS:
-                self._car_counted = False
+            return
+        wash["car_seen"] = 0
+        if not wash.get("car_counted") or not END_WASH_WHEN_CAR_LEAVES:
+            return
+        wash["car_away"] = wash.get("car_away", 0) + 1
+        if wash["car_away"] < CAR_LEFT_POLLS:
+            return
+        log.info("Bay %s: the car left (%s), ending the wash", self.bay_number,
+                 "out of range" if distance is None else f"{distance:.0f} cm")
+        try:
+            self.stop_run_locked()
+        except ControllerError as exc:
+            log.warning("Couldn't end the wash after the car left: %s", exc)
+            return
+        self.last_car_left_at = time.time()
 
     def _flow_sample_locked(self, flow_lpm: float) -> None:
         wash = self._wash
@@ -339,7 +369,40 @@ class HardwareBay:
             self.maintenance.no_flow_alert(
                 self.bay_number, self._link_source, f"{flow_lpm:.1f} L/min {elapsed:.0f} s into the wash")
 
+    def _check_idle_water_locked(self, flow_lpm: float, running: bool) -> None:
+        """Raise a fault if water is flowing while the valve is closed, and clear it once dry.
+
+        The sensor is ignored during a wash and for IDLE_WATER_GRACE_SECONDS after one (a
+        wet plate takes a while to dry). Water has to stay for IDLE_WATER_SECONDS to raise
+        the fault, and it has to stay dry that long to clear it, so one odd reading does
+        neither."""
+        now = time.time()
+        if running or (self._wash_ended_at and now - self._wash_ended_at < IDLE_WATER_GRACE_SECONDS):
+            self._idle_wet_since = None
+            self._idle_dry_since = None
+            return
+        alerted = any(f["active"] and f["fault_type"] == "water_while_idle"
+                      for f in self.database.get_bay(self.bay_number)["faults"])
+        if flow_lpm >= IDLE_WATER_LPM:
+            self._idle_dry_since = None
+            self._idle_wet_since = self._idle_wet_since or now
+            if not alerted and now - self._idle_wet_since >= IDLE_WATER_SECONDS:
+                self.database.add_fault(
+                    self.bay_number, self._link_source, "water_while_idle", "warning",
+                    f"Water is flowing while the bay is idle ({flow_lpm:.1f} L/min with the valve closed "
+                    f"for {now - self._idle_wet_since:.0f} s). The valve may be stuck open or leaking; "
+                    "check it. This clears by itself once the sensor reads dry.",
+                )
+        else:
+            self._idle_wet_since = None
+            if alerted:
+                self._idle_dry_since = self._idle_dry_since or now
+                if now - self._idle_dry_since >= IDLE_WATER_SECONDS:
+                    self.database.resolve_faults(self.bay_number, "water_while_idle")
+                    self._idle_dry_since = None
+
     def _finish_wash_locked(self) -> None:
+        self._wash_ended_at = time.time()
         wash, self._wash = self._wash, None
         if not wash or not wash["samples"]:
             return  # too short to measure, or no flow meter readings
@@ -503,6 +566,24 @@ class HardwareBay:
         self._record_motor_locked(motor)
         return session_id
 
+    def extend_run_locked(self, bay: dict, active: dict, seconds: int) -> None:
+        """Add `seconds` to the wash in progress: the valve stays open, and the LCD shows
+        the new total price."""
+        link = self._require_link_locked()
+        if not link.has("extend"):
+            raise ControllerError(
+                "This ESP32 firmware can't add time to a wash. Upload the current firmware.", "conflict")
+        price = price_for_seconds(bay, active["granted_seconds"] + seconds)
+        try:
+            motor = link.motor_add(seconds, label=self.wash_label(price))
+        except Esp32Error as exc:
+            raise ControllerError(f"The ESP32 refused to add time: {exc}", "conflict") from exc
+        except LINK_ERRORS as exc:
+            self._connection_lost_locked(exc)
+            raise ControllerError(f"Adding time failed: {exc}", "unavailable") from exc
+        self.database.extend_session(self.bay_number, seconds, price)
+        self._record_motor_locked(motor)
+
     def stop_run_locked(self) -> None:
         """Turn back to 0° now. Works whenever the motor is running, even with no recorded run."""
         link = self._require_link_locked()
@@ -535,6 +616,9 @@ class HardwareBay:
             "features": sorted(self._link.features) if connected and self._link else [],
             "firmware_version": self._link.firmware_version if connected and self._link else None,
             "button_run_seconds": BUTTON_RUN_SECONDS,
+            "car_present_cm": VEHICLE_PRESENT_CM,
+            "end_wash_when_car_leaves": END_WASH_WHEN_CAR_LEAVES,
+            "last_car_left_at": self.last_car_left_at,
             "last_button_at": self.last_button_at,
             "last_button_result": self.last_button_result,
             "port": self._link.port if connected and self._link else self._port_to_use(),

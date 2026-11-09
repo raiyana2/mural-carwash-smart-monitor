@@ -9,7 +9,10 @@ servo_status, timed runs (motor_on / motor_off / motor_status), rain, distance, 
 lcd_text / lcd_clear / lcd_backlight and ping, with the same events.
 
 To make testing easy:
-  * the rain value drifts slowly wet <-> dry
+  * the rain sensor (read as a water flow meter) is wet while the valve is open and dries
+    off over about 20 s after; type "leak" + Enter to make it wet with the valve closed
+    (to test the "water while idle" alert), and "leak" again to stop (or, from another
+    terminal: pkill -USR2 -f fake_esp32)
   * the distance swings between about 15 cm and 150 cm, so a "car" arrives and leaves
     every half minute or so
   * press Enter in this window to press the button (or, from another terminal:
@@ -28,17 +31,18 @@ import tty
 MAX_RUN_SECONDS = 3600
 REST_ANGLE, ACTIVE_ANGLE = 0, 180
 LCD_COLS = 16
-FEATURES = ["motor", "rain", "distance", "button", "lcd"]
+FEATURES = ["motor", "extend", "rain", "distance", "button", "lcd"]
 
 master, slave = os.openpty()
 tty.setraw(slave)
 print(f"fake ESP32 listening on {os.ttyname(slave)}", flush=True)
-print("press Enter here to press the bay's button", flush=True)
+print("press Enter here to press the bay's button; type leak + Enter to start/stop a leak", flush=True)
 
 booted = time.monotonic()
 servo = {"angle": REST_ANGLE, "running": False, "until": 0.0, "return_to": REST_ANGLE}
 lcd = {"idle": ["ESP32 Ready", ""], "shown": None, "backlight": True, "run_label": "Motor running"}
 stdin_open = sys.stdin is not None and sys.stdin.isatty()
+water = {"wet": 2.0, "leak": False, "at": time.monotonic()}
 
 
 def send(obj):
@@ -86,8 +90,16 @@ def status():
 
 # ---------------- sensors ----------------
 def rain():
-    t = time.monotonic() - booted
-    wet = 50 + 45 * math.sin(t / 20)                     # slowly goes wet <-> dry
+    # Wet (about 70%, i.e. 7 L/min) while the valve is open or leaking; otherwise it
+    # dries towards 2% over about 20 s, like a real sensor plate.
+    now = time.monotonic()
+    t, dt = now - booted, now - water["at"]
+    water["at"] = now
+    if servo["running"] or water["leak"]:
+        water["wet"] = 70 + 6 * math.sin(t / 3)
+    else:
+        water["wet"] = 2 + (water["wet"] - 2) * math.exp(-dt / 7)
+    wet = round(water["wet"], 1)
     raw = int(4095 - wet / 100 * 4095)
     return {"raw": raw, "wet_percent": round(wet, 1), "raining": wet > 60}
 
@@ -130,6 +142,19 @@ def handle(req):
             set_angle(angle)
             motor_event("started")
         data = status()
+    elif cmd == "motor_add":
+        s = float(req.get("seconds", 0))
+        left = max(0.0, servo["until"] - time.monotonic())
+        if not servo["running"]:
+            ok, err = False, "no run in progress"
+        elif s <= 0 or left + s > MAX_RUN_SECONDS:
+            ok, err = False, f"time left must stay <= {MAX_RUN_SECONDS} s"
+        else:
+            servo["until"] += s
+            if req.get("label"):
+                lcd["run_label"] = str(req["label"])[:LCD_COLS]
+            motor_event("extended")
+        data = status()
     elif cmd == "motor_off":
         hold_stop("stopped")
         data = status()
@@ -153,7 +178,7 @@ def handle(req):
         data = {"backlight": lcd["backlight"]}
     elif cmd == "ping":
         data = {"uptime_s": round(time.monotonic() - booted, 1), "firmware": "motor_rain_controller",
-                "version": 2, "features": FEATURES}
+                "version": 3, "features": FEATURES}
     elif cmd == "_press_button":                         # for tests: acts like a press of the real button
         press_button()
     else:
@@ -163,6 +188,14 @@ def handle(req):
 
 signal_presses = []
 signal.signal(signal.SIGUSR1, lambda *_: signal_presses.append(True))
+
+
+def toggle_leak(*_):
+    water["leak"] = not water["leak"]
+    print(f"  leak {'ON: water with the valve closed' if water['leak'] else 'off'}", flush=True)
+
+
+signal.signal(signal.SIGUSR2, toggle_leak)
 
 send({"type": "event", "event": "ready"})
 set_angle(REST_ANGLE)
@@ -178,8 +211,11 @@ while True:
     watch = [master] + ([sys.stdin] if stdin_open else [])
     r, _, _ = select.select(watch, [], [], 0.05)
     if stdin_open and sys.stdin in r:
-        if sys.stdin.readline() == "":
+        typed = sys.stdin.readline()
+        if typed == "":
             stdin_open = False                           # stdin closed: stop watching it
+        elif typed.strip().lower() == "leak":
+            toggle_leak()
         else:
             print("  button pressed", flush=True)
             press_button()

@@ -12,9 +12,9 @@ This folder is the local server: a FastAPI application and a SQLite database tha
 | Part | In the car wash | What the dashboard does with it |
 |---|---|---|
 | Servo | The bay's water valve | **Start wash** opens it (0° → 180°) for the time paid for, then the ESP32 closes it. While it's open the bay is **active**. Every wash is one open/close cycle, used to predict valve service. |
-| Rain sensor | Water flow meter | Read every 2 s and shown as litres per minute (fully wet = 10 L/min). Each wash records its average flow; low or no flow raises an alert and feeds the repair predictions. |
-| Ultrasonic sensor | Car counter | A car closer than 50 cm for 2 readings in a row is counted once; it has to leave before the next car counts. Counts appear on Operations, Bay Manager and Analytics. |
-| Button | Coin slot | Each press buys one minute ($1.00), the same as starting a 1-minute wash. Ignored while a wash is running, or when the bay is out of service or has an open fault. |
+| Rain sensor | Water flow meter | Read every 2 s and shown as litres per minute (fully wet = 10 L/min). Each wash records its average flow; low or no flow raises an alert and feeds the repair predictions. Water while the valve is closed raises a "water while idle" alert (below). |
+| Ultrasonic sensor | Car counter | Anything within 30 cm is a car in the bay. A car is **counted only during a wash**: once per wash, when it's within 30 cm for 2 readings in a row. After that, when it's further than 30 cm (or out of range) for 2 readings in a row, the car has left: the wash ends early and the valve closes. A wash with no car within 30 cm runs its full time. Counts appear on Operations, Bay Manager and Analytics. Settings in `carwash/config.py`: `VEHICLE_PRESENT_CM` (30), `END_WASH_WHEN_CAR_LEAVES` (True). |
+| Button | Coin slot | Each press buys one minute ($1.00): it starts a 1-minute wash, or adds a minute to the wash in progress (up to 60 minutes), and the LCD shows the new total price. Ignored when the bay is out of service or has an open fault. Adding time needs firmware version 3 (`motor_add`). |
 | LCD | Price display | Between washes: "$1.00 per minute / Max 60 min" ("Out of service" or "See attendant" when the bay can't be used). During a wash: the price paid and the time left, e.g. "Wash $5.00 / 4:59 left"; the ESP32 counts down by itself. "Bay 1 offline" when the dashboard disconnects. |
 
 The dashboard asks the firmware which parts it has (`features` in the `ping` reply) and only uses those, so older firmware still works.
@@ -28,7 +28,7 @@ By default every bay charges **$1.00 a minute**, for 1 to 60 minutes; a started 
 | Page | What it's for |
 |---|---|
 | **Operations** | Live overview: how many bays are ready or active, the wash floor (each bay's valve, countdown and cars counted today), what needs attention, and today's washes, revenue and cars. Select a bay to open it in Bay Manager. |
-| **Bay Manager** | One card per bay: a wash time in minutes with its price, **Start wash** and **Stop wash**. Each card shows the water flow and the car count; Bay 1's also shows what the button buys and what the LCD is showing. A dial shows the valve (closed = idle, open = active). |
+| **Bay Manager** | One card per bay: a wash time in minutes with its price, **Start wash**, **+1 min** (adds a minute to the wash in progress) and **Stop wash**. Each card shows the water flow and the car count; Bay 1's also shows what the button buys and what the LCD is showing. A dial shows the valve (closed = idle, open = active). |
 | **Analytics** | Financial reports from the database for the last 7, 30 or 90 days: revenue, washes, average sale, cars counted and the share of cars that bought a wash, each compared with the period before (when the database goes back that far). Charts of revenue by day, revenue by bay and washes by hour, a per-bay table with utilization, the daily figures, and **Download CSV**. Hover or tab to a bar for its numbers. |
 | **Maintenance** | **Equipment health** (below), the Bay 1 ESP32 connection (port picker, Connect / Disconnect / Ping, and the last connection error), open faults with **Resolve**, putting bays in or out of service, simulator test faults, and the fault log. |
 
@@ -39,10 +39,10 @@ The **Equipment health** table on the Maintenance page rates three pieces of equ
 | Equipment | Measured by | Status |
 |---|---|---|
 | Water flow (pump and nozzle) | Average flow of each wash. The bay's normal flow is the median of its first 20 washes after a service; its current flow is the average of the last 5. | **Not functioning**: no water in the last wash (under 0.5 L/min). **May be failing**: under 70% of normal. **Service soon**: a falling trend (least-squares over the last 14 days) reaches 70% within 7 days; further out it shows the predicted date. |
-| Valve (servo) | Open/close cycles since its last service, and this week's washes per day | **Service soon** when the 1,000-cycle service is due within 7 days (the date is predicted from the current rate). **Not functioning** if it was told to open and didn't respond. |
+| Valve (servo) | Open/close cycles since its last service, and this week's washes per day; Bay 1's flow meter while the valve is closed | **Service soon** when the 1,000-cycle service is due within 7 days (the date is predicted from the current rate). **May be failing** while water flows with the valve closed (stuck open or leaking). **Not functioning** if it was told to open and didn't respond. |
 | Car counter (ultrasonic) | Cars counted against washes in the last 24 hours | **Not functioning**: 3+ washes and no cars counted. **May be failing**: 5+ washes and fewer than half as many cars. |
 
-Problems also raise warnings under **Open faults** (and on Operations): "No water flow", "Low water flow" and "Valve service due". On Bay 1, a wash with no water at all raises the alert 10 seconds in, without waiting for the wash to end. The alerts clear themselves when the readings recover. After a repair, press **Mark serviced** on that piece of equipment: its history starts afresh and its alerts are resolved.
+Problems also raise warnings under **Open faults** (and on Operations): "No water flow", "Low water flow", "Valve service due" and "Water while idle". On Bay 1, a wash with no water at all raises the alert 10 seconds in, without waiting for the wash to end. **Water while idle:** when no wash is running and Bay 1's sensor reads at least 1 L/min (10% wet) for 10 seconds, the valve may be stuck open or leaking. It's ignored for 30 seconds after a wash, while the sensor plate drips and dries, and it clears by itself after 10 seconds dry. Settings: `IDLE_WATER_LPM`, `IDLE_WATER_SECONDS`, `IDLE_WATER_GRACE_SECONDS` in `carwash/config.py`. The alerts clear themselves when the readings recover. After a repair, press **Mark serviced** on that piece of equipment: its history starts afresh and its alerts are resolved.
 
 The simulated history includes some problems to show this off: Bay 10's pump has failed (no water), Bay 5's nozzle is clogging (low flow), Bay 8's pump is wearing (a predicted repair date a week or two out), and the busy Bay 7's valve is due for service. Bay 1 has no history until you run washes on it. The limits are in `carwash/config.py` (`FLOW_*`, `VALVE_SERVICE_CYCLES`, `SIM_HISTORY_DAYS`).
 
@@ -104,6 +104,7 @@ The application safely creates or upgrades its SQLite schema (`bays`, `pricing_s
 |---|---|
 | `GET /api/dashboard` | Every bay's live state, plus today's washes, revenue and cars |
 | `POST /api/bays/{n}/start` `{"seconds": 300}` | Start a wash (1–3600 s) |
+| `POST /api/bays/{n}/add` `{"seconds": 60}` | Add time to the wash in progress (and to its price), up to the bay's maximum |
 | `POST /api/bays/{n}/stop` | End a wash now |
 | `GET /api/reports?days=30` | Financial report for the last 1–365 days: totals, the period before, today, and figures by day, bay and hour |
 | `GET /api/maintenance` | Equipment health and repair predictions for every bay |
@@ -152,7 +153,7 @@ On Bay 1, **Start wash** is the firmware's timed hold (`motor_on` with angle 180
 
 The dashboard simulates Bays 2–11 as soon as the server starts. A new database gets 30 days of simulated washes, cars (including a few that drive through without buying) and water flow, so Analytics and Equipment health have something to show; this happens once per database. After that, simulated washes start now and then, record their flow and are checked like real ones. Use **Test faults** on the Maintenance page to inject missing motor feedback, missing water detection, a run that overran its limit, or an operator test fault. These only affect simulator bays. To start over, stop the server and delete `pi/data/monitor.sqlite3`.
 
-To test Bay 1 without the hardware (Linux only), run the fake ESP32 in another terminal. It acts like the current firmware, with a flow meter that drifts, a "car" that comes and goes on the ultrasonic sensor, and an LCD whose text it prints. Press Enter in its window to press the bay's button (or run `pkill -USR1 -f fake_esp32` from another terminal):
+To test Bay 1 without the hardware (Linux only), run the fake ESP32 in another terminal. It acts like the current firmware, with a flow meter that's wet while the valve is open and dries off after, a "car" that comes and goes on the ultrasonic sensor, and an LCD whose text it prints. Press Enter in its window to press the bay's button (or run `pkill -USR1 -f fake_esp32` from another terminal). Type `leak` and Enter (or `pkill -USR2 -f fake_esp32`) to make the sensor wet with the valve closed, to test the water-while-idle alert:
 
 ```bash
 cd ~/mural-carwash-smart-monitor/pi

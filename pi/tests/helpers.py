@@ -13,7 +13,7 @@ from carwash.storage.database import MonitorDatabase
 from carwash.web.app import app
 
 
-ALL_FEATURES = frozenset({"motor", "rain", "distance", "button", "lcd"})
+ALL_FEATURES = frozenset({"motor", "extend", "rain", "distance", "button", "lcd"})
 
 
 class StubLink:
@@ -57,6 +57,13 @@ class StubLink:
         if self.running:
             raise Esp32Error("motor already running")
         self.return_to, self.angle, self.running = self.angle, 180 if angle is None else angle, True
+        return self._status()
+
+    def motor_add(self, seconds, label=None):
+        self.calls.append(("motor_add", seconds))
+        if not self.running:
+            raise Esp32Error("no run in progress")
+        self.last_label = label
         return self._status()
 
     def motor_off(self):
