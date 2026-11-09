@@ -52,6 +52,9 @@ FLOW_NONE_LPM = 0.5              # less than this during a wash = no water: not 
 FLOW_LOW_FRACTION = 0.7          # less than 70% of the bay's normal flow = low: may be failing
 FLOW_SETTLE_SECONDS = 3          # readings this soon after a wash starts are skipped
 FLOW_CHECK_SECONDS = 10          # no water this long into a wash raises the alert right away
+IDLE_WATER_LPM = 1.0             # this much flow while the valve is closed = water while idle
+IDLE_WATER_SECONDS = 10          # ...for this long raises the alert (and this long dry clears it)
+IDLE_WATER_GRACE_SECONDS = 30    # ignore the sensor this long after a wash, while it drips and dries
 
 # ---------------- maintenance predictions ----------------
 VALVE_SERVICE_CYCLES = 1000      # service each valve (servo) every this many open/close cycles

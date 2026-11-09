@@ -482,6 +482,17 @@ class MonitorDatabase:
             )
             return bay_number
 
+    def open_faults_by_bay(self) -> dict[int, list[dict]]:
+        """Every open fault's type and severity, by bay, newest first."""
+        result: dict[int, list[dict]] = {}
+        with self.connection() as db:
+            for row in db.execute(
+                "SELECT bay_number, fault_type, severity FROM faults WHERE active = 1 ORDER BY created_at DESC"
+            ):
+                result.setdefault(row["bay_number"], []).append(
+                    {"fault_type": row["fault_type"], "severity": row["severity"]})
+        return result
+
     def recent_faults(self, limit: int = 8) -> list[dict]:
         with self.connection() as db:
             return [

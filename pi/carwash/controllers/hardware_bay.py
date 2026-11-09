@@ -9,7 +9,9 @@ and the ESP32 turns it back on its own timer, even if the Pi or the cable drops.
 
 The rain sensor stands in for a water flow meter: while the valve is open its readings
 are collected, a wash with no water raises an alert FLOW_CHECK_SECONDS in, and each
-wash's average flow is saved for the repair predictions (maintenance.py).
+wash's average flow is saved for the repair predictions (maintenance.py). While the
+valve is closed it should read dry: water then means the valve is stuck open or leaking,
+which raises a "water while idle" alert.
 
 With firmware that has them (it lists its features when pinged), HardwareBay also:
   * reads the ultrasonic sensor every DISTANCE_POLL_SECONDS: it shows whether a car is
@@ -45,6 +47,9 @@ from carwash.config import (
     FLOW_FULL_SCALE_LPM,
     FLOW_NONE_LPM,
     FLOW_SETTLE_SECONDS,
+    IDLE_WATER_GRACE_SECONDS,
+    IDLE_WATER_LPM,
+    IDLE_WATER_SECONDS,
     HARDWARE_BAY,
     HARDWARE_STALE_SECONDS,
     MOTOR_REST_ANGLE,
@@ -101,6 +106,11 @@ class HardwareBay:
         # whether the no-water alert has been raised.
         self._wash: Optional[dict] = None
         self.last_car_left_at: Optional[float] = None    # when a wash last ended because the car left
+        # Water while idle: when the sensor turned wet (or dry again) with the valve closed,
+        # and when the last wash ended (the sensor is ignored for a while after).
+        self._idle_wet_since: Optional[float] = None
+        self._idle_dry_since: Optional[float] = None
+        self._wash_ended_at: Optional[float] = None
         # Button presses: the reader thread sets _button_pending and calls wake();
         # poll_locked() then calls on_button() under the lock.
         self.on_button: Optional[Callable[[], None]] = None   # set by MonitorController
@@ -298,7 +308,9 @@ class HardwareBay:
             )
         self._record_motor_locked(motor)
         if reading is not None:
-            self._flow_sample_locked(reading.wet_percent / 100 * FLOW_FULL_SCALE_LPM)
+            flow = reading.wet_percent / 100 * FLOW_FULL_SCALE_LPM
+            self._flow_sample_locked(flow)
+            self._check_idle_water_locked(flow, motor.running)
         if distance_read:
             self._track_car_locked(distance)
         if self._button_pending:
@@ -357,7 +369,40 @@ class HardwareBay:
             self.maintenance.no_flow_alert(
                 self.bay_number, self._link_source, f"{flow_lpm:.1f} L/min {elapsed:.0f} s into the wash")
 
+    def _check_idle_water_locked(self, flow_lpm: float, running: bool) -> None:
+        """Raise a fault if water is flowing while the valve is closed, and clear it once dry.
+
+        The sensor is ignored during a wash and for IDLE_WATER_GRACE_SECONDS after one (a
+        wet plate takes a while to dry). Water has to stay for IDLE_WATER_SECONDS to raise
+        the fault, and it has to stay dry that long to clear it, so one odd reading does
+        neither."""
+        now = time.time()
+        if running or (self._wash_ended_at and now - self._wash_ended_at < IDLE_WATER_GRACE_SECONDS):
+            self._idle_wet_since = None
+            self._idle_dry_since = None
+            return
+        alerted = any(f["active"] and f["fault_type"] == "water_while_idle"
+                      for f in self.database.get_bay(self.bay_number)["faults"])
+        if flow_lpm >= IDLE_WATER_LPM:
+            self._idle_dry_since = None
+            self._idle_wet_since = self._idle_wet_since or now
+            if not alerted and now - self._idle_wet_since >= IDLE_WATER_SECONDS:
+                self.database.add_fault(
+                    self.bay_number, self._link_source, "water_while_idle", "warning",
+                    f"Water is flowing while the bay is idle ({flow_lpm:.1f} L/min with the valve closed "
+                    f"for {now - self._idle_wet_since:.0f} s). The valve may be stuck open or leaking; "
+                    "check it. This clears by itself once the sensor reads dry.",
+                )
+        else:
+            self._idle_wet_since = None
+            if alerted:
+                self._idle_dry_since = self._idle_dry_since or now
+                if now - self._idle_dry_since >= IDLE_WATER_SECONDS:
+                    self.database.resolve_faults(self.bay_number, "water_while_idle")
+                    self._idle_dry_since = None
+
     def _finish_wash_locked(self) -> None:
+        self._wash_ended_at = time.time()
         wash, self._wash = self._wash, None
         if not wash or not wash["samples"]:
             return  # too short to measure, or no flow meter readings

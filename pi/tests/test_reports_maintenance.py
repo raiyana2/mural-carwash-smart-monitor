@@ -149,6 +149,47 @@ class Bay1SensorHistoryTests(unittest.TestCase):
         self.assertTrue(self.link.running)
         self.assertEqual(self.cars(), 1)
 
+    def idle_water_faults(self):
+        return [f for f in self.controller.database.recent_faults(20)
+                if f["active"] and f["fault_type"] == "water_while_idle"]
+
+    def test_water_while_the_valve_is_closed_raises_an_alert(self):
+        self.link.rain_wet = 0.0
+        self.poll()
+        self.link.rain_wet = 60.0                  # 6 L/min with no wash running
+        self.poll()
+        self.assertEqual(self.idle_water_faults(), [])       # not straight away
+        self.hw._idle_wet_since -= 11
+        self.poll()
+        faults = self.idle_water_faults()
+        self.assertEqual(len(faults), 1)
+        self.assertIn("valve may be stuck open or leaking", faults[0]["explanation"])
+        valve = self.controller.maintenance.valve(self.controller.database.get_bay(1))
+        self.assertEqual(valve["status"], "failing")
+        self.assertNotEqual(self.controller.bay_detail(1)["status"], "faulted")   # an alert, not a lock-out
+        self.link.rain_wet = 0.0                   # dry again: clears after a while
+        self.poll()
+        self.assertEqual(len(self.idle_water_faults()), 1)
+        self.hw._idle_dry_since -= 11
+        self.poll()
+        self.assertEqual(self.idle_water_faults(), [])
+
+    def test_water_during_and_just_after_a_wash_is_not_a_leak(self):
+        self.link.rain_wet = 70.0
+        self.controller.start_session(1, 60)
+        self.poll()
+        self.hw._idle_wet_since = time.time() - 60     # would trip if it were checked
+        self.poll()
+        self.link.motor_off()                      # wash over; the plate is still wet
+        self.poll()
+        self.poll()
+        self.assertEqual(self.idle_water_faults(), [])
+        self.hw._wash_ended_at -= 31               # grace period over, still wet
+        self.poll()
+        self.hw._idle_wet_since -= 11
+        self.poll()
+        self.assertEqual(len(self.idle_water_faults()), 1)
+
     def test_wash_records_its_average_water_flow(self):
         self.link.rain_wet = 80.0
         self.controller.start_session(1, 60)
@@ -224,6 +265,11 @@ class SimulatedHistoryTests(unittest.TestCase):
         self.assertIn((5, "flow_low"), active)
         self.assertIn((7, "valve_service_due"), active)
         self.assertNotIn((3, "flow_low"), active)
+
+    def test_dashboard_lists_each_bays_open_faults(self):
+        bays = {b["bay_number"]: b for b in self.controller.dashboard()["bays"]}
+        self.assertIn("flow_none", [f["fault_type"] for f in bays[10]["open_faults"]])
+        self.assertEqual(bays[3]["open_faults"], [])
 
     def test_financial_report_adds_up(self):
         report = self.controller.financial_report(30)

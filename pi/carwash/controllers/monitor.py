@@ -131,12 +131,14 @@ class MonitorController:
         midnight = time.mktime(time.localtime(now)[:3] + (0, 0, 0, 0, 0, -1))
         cars_today = self.database.count_readings_by_bay("car", midnight)
         last_flow = self.database.latest_reading_by_bay("flow")
+        open_faults = self.database.open_faults_by_bay()
         result["hardware"] = hardware
         result["bays"] = [self._decorate(bay, hardware, now) for bay in result["bays"]]
         for bay in result["bays"]:
             bay["cars_today"] = cars_today.get(bay["bay_number"], 0)
             flow = last_flow.get(bay["bay_number"])
             bay["last_wash_flow_lpm"] = flow["value"] if flow else None
+            bay["open_faults"] = open_faults.get(bay["bay_number"], [])
         result["motor_run_angle"] = MOTOR_RUN_ANGLE
         result["motor_rest_angle"] = MOTOR_REST_ANGLE
         return result

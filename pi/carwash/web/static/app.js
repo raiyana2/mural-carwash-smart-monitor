@@ -116,9 +116,18 @@ const FAULT_NAMES = {
   motor_feedback_missing: "Valve not responding", water_not_detected: "Water not detected",
   session_overrun: "Wash ran over its time", session_duration_limit: "Wash over the time limit",
   purchased_granted_mismatch: "Paid time doesn't match", operator_test_fault: "Test fault",
+  water_while_idle: "Water while idle (leak?)", esp32_restarted: "ESP32 restarted",
+  serial_connection_lost: "ESP32 connection lost",
 };
 function faultName(type) {
   return FAULT_NAMES[type] || String(type || "").replaceAll("_", " ");
+}
+
+// One line naming a bay's open faults, e.g. "! No water flow" or "! Low water flow +1 more".
+function faultSummary(bay) {
+  const faults = bay.open_faults || [];
+  if (!faults.length) return "";
+  return `! ${faultName(faults[0].fault_type)}${faults.length > 1 ? ` +${faults.length - 1} more` : ""}`;
 }
 
 function plural(n, word, many = `${word}s`) {
@@ -333,6 +342,7 @@ function floorSlot(bay) {
       <span class="slot-drawing">${dialSVG("dial-mini")}</span>
       <strong class="slot-mode" data-field="headline"></strong>
       <span class="slot-time" data-field="caption"></span>
+      <span class="slot-fault" data-field="faults"></span>
       <span class="slot-vehicle" data-field="vehicle"></span>
       <span class="slot-source" data-field="cars"></span>
     </span>
@@ -366,7 +376,7 @@ function mountOperations(data) {
     <div class="operations-layout">
       <section class="facility-map">
         <div class="section-title"><div><p class="eyebrow">FACILITY / 01</p><h2>Wash floor</h2></div><span class="table-note">Conceptual layout · arrangement to be confirmed</span></div>
-        <div class="legend"><span>● Ready</span><span>▰ Active (valve open)</span><span>! Fault</span><span>○ Offline / out of service</span></div>
+        <div class="legend"><span>● Ready</span><span>▰ Active (valve open)</span><span class="legend-fault">! Red = open fault</span><span>○ Offline / out of service</span></div>
         <div class="bay-grid">${data.bays.map(floorSlot).join("")}</div>
         <div class="map-caption">↑ BAY ACCESS / CONCEPTUAL SERVICE AISLE</div>
       </section>
@@ -389,12 +399,14 @@ function updateOperations(data) {
   setText(field(app, "ready-title"), `${ready} bay${ready === 1 ? "" : "s"} ready`);
   setText(field(app, "ready-copy"), unavailable ? `${unavailable} bay${unavailable === 1 ? "" : "s"} offline, faulted, or out of service.` : "Every bay is active or ready.");
   setHTML(field(app, "running"), `${running}<small> / ${data.bays.length}</small>`);
-  setHTML(field(app, "bars"), data.bays.map((b, i) => `<i class="bar-${states[i]}" title="${escapeHTML(b.label)}: ${STATE_LABELS[states[i]]}"></i>`).join(""));
+  setHTML(field(app, "bars"), data.bays.map((b, i) => `<i class="bar-${(b.open_faults || []).length ? "faulted" : states[i]}" title="${escapeHTML(b.label)}: ${STATE_LABELS[states[i]]}${(b.open_faults || []).length ? `, ${escapeHTML(faultSummary(b).slice(2))}` : ""}"></i>`).join(""));
   for (const bay of data.bays) {
     const slot = app.querySelector(`[data-slot="${bay.bay_number}"]`);
     if (!slot) continue;
     const state = bayState(bay);
-    slot.className = `bay-slot bay-${state} ${bay.source === "hardware" ? "physical-slot" : ""}`;
+    const hasFault = (bay.open_faults || []).length > 0;
+    slot.className = `bay-slot bay-${state} ${bay.source === "hardware" ? "physical-slot" : ""} ${hasFault ? "bay-has-fault" : ""}`;
+    setText(field(slot, "faults"), faultSummary(bay));
     setHTML(field(slot, "status"), statusTag(state));
     setText(field(slot, "headline"), headline(bay));
     setText(field(slot, "caption"), caption(bay));
@@ -425,6 +437,7 @@ function bayCard(bay) {
       <div class="bay-card-readout"><strong data-field="headline"></strong><span data-field="caption"></span></div>
     </div>
     <div class="run-progress" aria-hidden="true"><i data-field="progress"></i></div>
+    <p class="fault-line" data-field="faults"></p>
     <p class="sensor-line" data-field="flow"></p>
     <p class="sensor-line" data-field="cars"></p>
     ${hardware ? `<p class="sensor-line" data-field="button"></p><p class="sensor-line" data-field="lcd"></p>` : ""}
@@ -533,7 +546,11 @@ function updateBays(data) {
     const blocked = blockedReason(bay);
     const busy = busyBays.has(bay.bay_number);
     const expanded = expandedBays.has(bay.bay_number);
-    card.className = `bay-card bay-card-${state} ${bay.source === "hardware" ? "bay-card-physical" : ""} ${expanded ? "bay-card-expanded" : ""}`;
+    const faults = bay.open_faults || [];
+    card.className = `bay-card bay-card-${state} ${bay.source === "hardware" ? "bay-card-physical" : ""} ${expanded ? "bay-card-expanded" : ""} ${faults.length ? "bay-card-has-fault" : ""}`;
+    setText(field(card, "faults"), faults.length
+      ? `${faultSummary(bay)} · ${expanded ? "see Faults" : "show details to resolve"}`
+      : "");
     const expandButton = field(card, "expand");
     expandButton.setAttribute("aria-expanded", String(expanded));
     setText(expandButton, expanded ? "Hide details ↑" : "Show details ↓");
