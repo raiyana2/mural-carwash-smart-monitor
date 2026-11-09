@@ -156,7 +156,7 @@ class ControllerErrorApiTests(unittest.TestCase):
                 offline = client.post("/api/bays/1/start", json={"seconds": 5})
                 self.assertEqual(offline.status_code, 503)
                 self.assertIn("Maintenance", offline.json()["detail"])
-                self.assertEqual(client.post("/api/bays/2/start", json={"seconds": 999}).status_code, 422)
+                self.assertEqual(client.post("/api/bays/2/start", json={"seconds": 3601}).status_code, 422)
 
     def test_web_layer_has_no_controller_logic(self):
         web_dir = Path(__file__).parent.parent / "carwash" / "web"

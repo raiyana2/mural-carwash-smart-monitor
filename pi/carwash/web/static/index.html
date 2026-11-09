@@ -18,12 +18,13 @@
         <nav class="navigation" aria-label="Main navigation">
           <a href="#/" data-nav="operations">Operations</a>
           <a href="#/bays" data-nav="bays">Bay Manager</a>
+          <a href="#/analytics" data-nav="analytics">Analytics</a>
           <a href="#/maintenance" data-nav="maintenance">Maintenance<span id="fault-nav-count" class="nav-count" title="Open faults">0</span></a>
         </nav>
         <div class="sidebar-spacer"></div>
         <a class="site-card" href="#/maintenance">
           <span class="site-indicator"></span>
-          <div><strong>LOCAL SITE</strong><small>Offline-ready · Raspberry Pi</small><small id="sidebar-connection">ESP32 · Checking</small></div>
+          <div><strong>LOCAL SITE</strong><small>Offline-ready · Local computer</small><small id="sidebar-connection">ESP32 · Checking</small></div>
         </a>
         <div class="sidebar-foot">MURAL SMART MONITOR <span>v1.1 · DEMO</span></div>
       </aside>
@@ -46,6 +47,7 @@
         <footer class="footer">MURAL CAR WASH SMART MONITOR <span>Bay 1 is the real ESP32. Bays 2–11 are tagged SIMULATED and run in the local demo simulator.</span></footer>
       </main>
     </div>
+    <script src="/static/charts.js" defer></script>
     <script src="/static/app.js" defer></script>
   </body>
 </html>
