@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#F4F1EA">
+    <title>Mural Car Wash | Operations</title>
+    <link rel="stylesheet" href="/static/style.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <a class="brand" href="#/">
+          <span class="brand-mark">M</span>
+          <span><strong>MURAL</strong><small>CAR WASH SYSTEMS</small></span>
+        </a>
+        <div class="sidebar-label">CONTROL</div>
+        <nav class="navigation" aria-label="Main navigation">
+          <a href="#/" data-nav="operations">Operations</a>
+          <a href="#/bays" data-nav="bays">Bay Manager</a>
+          <a href="#/maintenance" data-nav="maintenance">Maintenance<span id="fault-nav-count" class="nav-count" title="Open faults">0</span></a>
+        </nav>
+        <div class="sidebar-spacer"></div>
+        <a class="site-card" href="#/maintenance">
+          <span class="site-indicator"></span>
+          <div><strong>LOCAL SITE</strong><small>Offline-ready · Raspberry Pi</small><small id="sidebar-connection">ESP32 · Checking</small></div>
+        </a>
+        <div class="sidebar-foot">MURAL SMART MONITOR <span>v1.1 · DEMO</span></div>
+      </aside>
+
+      <main class="main-shell">
+        <header class="topbar">
+          <div class="breadcrumbs"><span>MURAL</span><b>/</b><strong id="page-context">Operations</strong></div>
+          <div class="topbar-right">
+            <span class="offline-pill"><i></i>Local system</span>
+            <span id="clock" class="clock">--:--:--</span>
+            <a href="#/maintenance" aria-label="Maintenance">⚙</a>
+          </div>
+        </header>
+        <div class="page-content">
+          <div class="notice" id="notice" role="status"></div>
+          <div id="app" aria-live="polite">
+            <div class="loading">Loading local operations data…</div>
+          </div>
+        </div>
+        <footer class="footer">MURAL CAR WASH SMART MONITOR <span>Bay 1 is the real ESP32. Bays 2–11 are tagged SIMULATED and run in the local demo simulator.</span></footer>
+      </main>
+    </div>
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>

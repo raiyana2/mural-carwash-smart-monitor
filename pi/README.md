@@ -7,9 +7,54 @@ The Raspberry Pi hosts a local FastAPI application and SQLite database. Its brow
 | 1 | Hardware | One `Esp32Link` instance communicates with the real ESP32 over USB serial. Rain, motor state and angle, ping, and the timed 180° run come from the firmware protocol (see the [main README](../README.md)). The documented physical bay has no vehicle, wash-water flow, or independent motor-feedback sensor. |
 | 2–11 | Simulator | Local Python simulator mirrors the same 180° timed run, generates labelled demo activity and occasional faults. No serial hardware is used for these bays. |
 
+## Architecture
+
+```
+pi/
+├── web_app.py              launcher kept for `uvicorn web_app:app` (imports carwash.web.app)
+├── carwash/                the application, in layers; each layer only uses the ones below it
+│   ├── config.py           every shared setting: bay count, motor angles, 300 s limit, timings, paths
+│   ├── web/                ── interface ── no logic of its own
+│   │   ├── app.py          FastAPI routes; turns ControllerError into HTTP 404/409/422/503
+│   │   ├── schemas.py      request bodies the API accepts
+│   │   └── static/         the browser page (index.html, app.js, style.css, fonts)
+│   ├── controllers/        ── logic ──
+│   │   ├── monitor.py      MonitorController: the one entry point the web layer calls
+│   │   ├── hardware_bay.py HardwareBay: Bay 1's serial link (connect, poll, run, stop)
+│   │   ├── simulator.py    Simulator: Bays 2-11 and the test faults
+│   │   ├── pricing.py      simulated price for a run
+│   │   ├── errors.py       ControllerError (kinds: not_found, invalid, conflict, unavailable)
+│   │   └── esp32_controller.py  standalone Controller for other UIs (not used by the dashboard)
+│   ├── storage/
+│   │   └── database.py     SQLite: bays, pricing settings, runs, faults
+│   └── hardware/
+│       └── esp32_link.py   Esp32Link: the USB serial client for the firmware's JSON protocol
+├── tools/                  command-line programs: cli.py, example.py, controller_demo.py, fake_esp32.py
+├── tests/                  one test file per layer, plus an end-to-end run against fake_esp32.py
+└── data/                   the SQLite database (not in git)
+```
+
+```
+browser ──HTTP──> web/app.py ──> MonitorController ──┬──> HardwareBay ──> Esp32Link ──USB──> ESP32 (Bay 1)
+                                                    ├──> Simulator                              (Bays 2-11)
+                                                    └──> MonitorDatabase ──> data/monitor.sqlite3
+```
+
+Where to make a change:
+
+| To change… | Edit |
+|---|---|
+| A limit, angle, timing or the number of bays | `carwash/config.py` |
+| What a page shows or how it looks | `carwash/web/static/app.js`, `style.css` |
+| A new API route | `carwash/web/app.py` (and `schemas.py` for its request body), calling a `MonitorController` method |
+| Rules about when a bay may run | `carwash/controllers/monitor.py` |
+| How Bay 1 talks to the ESP32 | `carwash/controllers/hardware_bay.py`, and `carwash/hardware/esp32_link.py` for the wire protocol |
+| Simulated bays or test faults | `carwash/controllers/simulator.py` |
+| Stored data | `carwash/storage/database.py` |
+
 `esp32_link.py` remains the only Python serial client. The web service uses its `open()`, `ping()`, `read_rain()`, `motor_status()`, `motor_on()` and `motor_off()` methods (and `servo_set(0)` only to put the servo back at rest before a run). A background worker owns that one Bay 1 connection, polls it, and retries after a disconnect; **Disconnect** pauses those retries until **Connect** is pressed. Serial calls run outside the browser request loop. The interactive CLI and command-line examples remain available.
 
-The application safely initializes its SQLite schema (`bays`, `pricing_settings`, `sessions`, `faults`) at startup. Bay configuration, integer-cent prices, session records, and fault history persist across restarts. The default database is `pi/data/monitor.sqlite3`; set `MURAL_MONITOR_DB` to use another local path. All payments and revenue in this milestone are simulated. No external API, payment processor, CDN, or internet connection is used at runtime.
+The application safely initializes its SQLite schema (`bays`, `pricing_settings`, `sessions`, `faults`) at startup. Bay configuration, integer-cent prices, run records, and fault history persist across restarts. The default database is `pi/data/monitor.sqlite3`; set `MURAL_MONITOR_DB` to use another local path. All payments and revenue in this milestone are simulated. No external API, payment processor, CDN, or internet connection is used at runtime.
 
 ## Raspberry Pi OS installation and launch
 
@@ -35,6 +80,8 @@ source .venv/bin/activate
 python -m uvicorn web_app:app --host 127.0.0.1 --port 8000
 ```
 
+(`web_app:app` and `carwash.web.app:app` are the same app; run either from the `pi` folder.)
+
 Open <http://127.0.0.1:8000> on the Raspberry Pi. This loopback-only default keeps control local to the Pi. Bay 1 attempts the `ESP32_PORT` environment variable when set, then uses USB auto-detection. To pick a port in the UI, open **Maintenance**, press **Scan ports**, press **Use** next to the board (`/dev/ttyUSB0` or `/dev/ttyACM0` on the Pi, `COM5`-style on Windows), then **Connect**. Only this web process should own that serial port; close the PlatformIO/Arduino serial monitor and any other serial client first.
 
 On Windows (for development), the same steps are:
@@ -58,7 +105,7 @@ To test the original USB serial protocol and Bay 1 screen without physical hardw
 ```bash
 cd ~/mural-carwash-smart-monitor/pi
 source .venv/bin/activate
-python fake_esp32.py
+python tools/fake_esp32.py
 ```
 
 Copy the printed virtual serial path (for example `/dev/pts/3`) into the **Serial port** field on the Maintenance page and press **Connect**. This test connects the ordinary `Esp32Link` client to the simulator; it does not change Bay 1's configured hardware data source or provide real sensor evidence. Stop the fake device with Ctrl+C; the dashboard should mark Bay 1 offline and record a serial-loss incident after a successful connection has been lost.
@@ -69,17 +116,19 @@ Copy the printed virtual serial path (for example `/dev/pts/3`) into the **Seria
 cd ~/mural-carwash-smart-monitor/pi
 source .venv/bin/activate
 python -m pip install -r requirements-dev.txt
-python -m unittest discover -s tests -v
+python -m unittest -v
 ```
+
+Run it from the `pi` folder. The tests are split by layer: `test_database.py`, `test_esp32_link.py`, `test_controllers.py`, `test_api.py`, and `test_end_to_end.py` (which runs the real serial client and dashboard against `tools/fake_esp32.py`; Linux/Pi only).
 
 The test client dependency from `requirements-dev.txt` is only needed for API tests, not to run the dashboard.
 
 ## Existing command-line controls
 
 ```bash
-python main.py                         # finds an ESP32 USB port
-python main.py --port /dev/ttyUSB0
-python example.py /dev/ttyUSB0
+python -m tools.cli                    # finds an ESP32 USB port
+python -m tools.cli --port /dev/ttyUSB0
+python -m tools.example /dev/ttyUSB0
 ```
 
 Interactive commands are `angle DEGREES`, `on SECONDS [ANGLE]`, `off`, `status`, `rain`, `watch [SECONDS]`, `ping`, `help`, and `quit`. See [Command-line tools and the serial client](#command-line-tools-and-the-serial-client) below.
@@ -94,7 +143,7 @@ Interactive commands are `angle DEGREES`, `on SECONDS [ANGLE]`, `off`, `status`,
 
 Pricing, wash modes and analytics are no longer in the interface. Their API routes (`/api/pricing/preview`, `/api/bays/{n}/settings`, `/api/analytics`) still exist, and runs are still saved in SQLite.
 
-The interface bundles IBM Plex Sans and Mono in `static/fonts` with their license and requires no font CDN. Pages are drawn once and then patched every second, so countdowns stay live without clearing what you type.
+The interface bundles IBM Plex Sans and Mono in `carwash/web/static/fonts` with their license and requires no font CDN. Pages are drawn once and then patched every second, so countdowns stay live without clearing what you type.
 
 ## Troubleshooting the ESP32 connection
 
@@ -104,9 +153,10 @@ When **Connect** fails, the Maintenance page shows the reason in red. What each 
 |---|---|
 | "No ESP32 found on USB" | The list shows every port the computer can see. If none looks like the board, try another USB cable (many are charge-only) and check the board's USB driver (CP210x or CH340/CH9102). Otherwise pick the port yourself. |
 | "There is no port called …" | The port name is wrong for this computer: `COM5`-style on Windows, `/dev/ttyUSB0` or `/dev/ttyACM0` on the Pi. Press **Scan ports** and **Use** the right one. |
-| "… is already in use by another program" | Close the PlatformIO/Arduino serial monitor, wait for any upload to finish, and make sure only one dashboard (or `main.py`) is running. |
+| "… is already in use by another program" | Close the PlatformIO/Arduino serial monitor, wait for any upload to finish, and make sure only one dashboard (or `tools/cli.py`) is running. |
 | "No permission to open …" (Pi) | `sudo usermod -aG dialout $USER`, then log out and back in. |
-| "… opened, but the ESP32 didn't answer" | The port works but the firmware isn't replying. Upload `src/main.cpp` (PlatformIO → Upload), press the board's RESET button, and connect again. The dashboard already pulsed the reset line once before giving up. |
+| "… running older firmware that doesn't have the motor commands" | The board has an old firmware build. Press **Disconnect**, upload the current firmware with PlatformIO, then **Connect**. |
+| "… opened, but the ESP32 didn't answer" | The port works but the firmware isn't replying. Upload the firmware (PlatformIO → Upload), press the board's RESET button, and connect again. The dashboard already pulsed the reset line once before giving up. |
 
 To upload firmware while the dashboard is running, press **Disconnect** first. The dashboard then stays off the port until you press **Connect**, so the upload isn't interrupted.
 
@@ -114,22 +164,19 @@ If Bay 1 logs "The ESP32 restarted on its own", the board is browning out, usual
 
 ## Command-line tools and the serial client
 
-| File | What it is |
-|---|---|
-| `web_app.py`, `database.py`, `static/` | The web dashboard (FastAPI + SQLite + browser page) |
-| `esp32_link.py` | The `Esp32Link` class: talks to the ESP32 over USB |
-| `main.py` | Interactive control: type commands, see motor events live |
-| `example.py` | A short script showing how to use `Esp32Link` |
-| `controller.py`, `controller_demo.py` | A standalone controller for building other UIs |
-| `fake_esp32.py` | A pretend ESP32 for testing without hardware (Linux/Pi only) |
-| `tests/` | Dashboard tests |
+| File (in `tools/`) | What it is | Run it from `pi/` with |
+|---|---|---|
+| `cli.py` | Interactive control: type commands, see motor events live | `python -m tools.cli` |
+| `example.py` | A short script showing how to use `Esp32Link` | `python -m tools.example` |
+| `controller_demo.py` | Shows how another UI would use the standalone `Controller` | `python -m tools.controller_demo` |
+| `fake_esp32.py` | A pretend ESP32 for testing without hardware (Linux/Pi only) | `python tools/fake_esp32.py` |
 
 ### Interactive control
 
 ```bash
-python main.py                    # finds the ESP32 automatically
-python main.py --port COM5        # Windows (check Device Manager for the COM number)
-python main.py --port /dev/ttyUSB0
+python -m tools.cli                    # finds the ESP32 automatically
+python -m tools.cli --port COM5        # Windows (check Device Manager for the COM number)
+python -m tools.cli --port /dev/ttyUSB0
 ```
 
 ```
@@ -157,7 +204,7 @@ Commands: `angle DEGREES`, `on SECONDS [ANGLE]`, `off`, `status`, `rain`, `watch
 ### In your own code
 
 ```python
-from esp32_link import Esp32Link, Esp32Error
+from carwash.hardware.esp32_link import Esp32Link, Esp32Error
 
 with Esp32Link() as esp:                 # or Esp32Link("COM5")
     esp.servo_set(90)                    # move and stay -> MotorStatus(running=False, remaining_s=0, angle=90)
@@ -187,7 +234,7 @@ UI (buttons, labels)  ──actions──>  Controller  ──>  Esp32Link  ─�
         └──── on_change(state) ────────┘
 ```
 
-The web dashboard has its own controller (`MonitorController` in `web_app.py`). `controller.py` is a lighter, standalone layer for building a *different* UI, such as a desktop window. The controller:
+`carwash/controllers/esp32_controller.py` has `Controller`, a light, standalone layer for one ESP32, for building a *different* UI such as a desktop window. (The web dashboard uses `MonitorController` instead; see [Architecture](#architecture).) `Controller`:
 - keeps **one up-to-date snapshot** of everything (`ControllerState`)
 - **calls your function whenever it changes**, including once a second while the servo is running, so a countdown can update
 - has **button-style actions** that never crash. They return `ActionResult(ok, message)`, ready to show to the user.
@@ -196,7 +243,7 @@ The web dashboard has its own controller (`MonitorController` in `web_app.py`). 
 - keeps a **log** of what happened (connected, started, returned, errors)
 
 ```python
-from controller import Controller
+from carwash.controllers.esp32_controller import Controller
 
 ctl = Controller()                      # or Controller(port="COM5", rain_interval_s=2)
 ctl.subscribe(on_change)                # on_change(state) is called on every change
@@ -229,12 +276,12 @@ Actions return `ok=False` with a readable message when something's wrong: `"Not 
 **Threads:** `on_change` runs on the controller's background threads. Most UI toolkits only allow widget updates from their own thread, so hand the update over. In Tkinter that's `root.after(0, lambda: redraw(state))`; in asyncio it's `loop.call_soon_threadsafe(...)`.
 
 ```bash
-python controller_demo.py               # see it in action (or: python controller_demo.py COM5)
+python -m tools.controller_demo         # see it in action (or: python -m tools.controller_demo COM5)
 ```
 
 ### Testing without an ESP32 (on the Pi or Linux)
 
 ```bash
-python fake_esp32.py              # prints e.g. "listening on /dev/pts/3"
-python main.py --port /dev/pts/3  # in a second terminal
+python tools/fake_esp32.py              # prints e.g. "listening on /dev/pts/3"
+python -m tools.cli --port /dev/pts/3   # in a second terminal
 ```

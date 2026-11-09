@@ -11,13 +11,13 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import serial
-from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import esp32_link
 from database import MonitorDatabase
 from esp32_link import Esp32ConnectError
-from web_app import MonitorController, app
+from controller import ControllerError, MonitorController
+from web_app import app
 
 
 class MonitorDatabaseTests(unittest.TestCase):
@@ -293,13 +293,33 @@ class MotorRunApiTests(unittest.TestCase):
             self.assertEqual(client.put("/api/bays/5/enabled", json={"enabled": True}).json()["enabled"], 1)
 
 
+class ControllerErrorApiTests(unittest.TestCase):
+    def test_controller_errors_become_http_errors(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = connected_controller(temp_dir, StubLink())
+            controller.disconnect_hardware()
+            with patch("web_app.controller", controller), patch.object(controller, "start"), \
+                    patch.object(controller, "close"), TestClient(app) as client:
+                self.assertEqual(client.get("/api/bays/99").status_code, 404)
+                offline = client.post("/api/bays/1/start", json={"seconds": 5})
+                self.assertEqual(offline.status_code, 503)
+                self.assertIn("Maintenance", offline.json()["detail"])
+                self.assertEqual(client.post("/api/bays/2/start", json={"seconds": 999}).status_code, 422)
+
+    def test_web_app_has_no_controller_logic(self):
+        import web_app
+        source = Path(web_app.__file__).read_text()
+        for name in ("import serial", "from esp32_link", "from database", "import threading", "HTTPException", ".database."):
+            self.assertNotIn(name, source)
+
+
 class ConnectionTests(unittest.TestCase):
     def test_disconnect_pauses_auto_connect_until_connect(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             controller = connected_controller(temp_dir, StubLink())
             controller.disconnect_hardware()
             self.assertIsNone(controller._link)
-            with patch("web_app.Esp32Link") as link_class:
+            with patch("controller.Esp32Link") as link_class:
                 controller._next_connect_at = 0
                 controller._maybe_auto_connect()
                 link_class.assert_not_called()
@@ -309,12 +329,12 @@ class ConnectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             controller = connected_controller(temp_dir, StubLink())
             error = Esp32ConnectError("COM5 opened, but the ESP32 didn't answer.", "no_answer", "COM5")
-            with patch("web_app.Esp32Link") as link_class:
+            with patch("controller.Esp32Link") as link_class:
                 link_class.return_value.open.side_effect = error
-                with self.assertRaises(HTTPException) as raised:
+                with self.assertRaises(ControllerError) as raised:
                     controller.connect_hardware("COM5")
-            self.assertEqual(raised.exception.status_code, 503)
-            self.assertIn("didn't answer", raised.exception.detail)
+            self.assertEqual(raised.exception.kind, "unavailable")
+            self.assertIn("didn't answer", str(raised.exception))
             hardware = controller.dashboard()["hardware"]
             self.assertEqual(hardware["last_error_kind"], "no_answer")
             self.assertGreaterEqual(hardware["retry_in_s"], 15)

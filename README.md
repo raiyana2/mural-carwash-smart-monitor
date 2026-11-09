@@ -3,7 +3,7 @@
 Offline Raspberry Pi + ESP32 prototype for monitoring and demonstrating an 11-bay self-serve car wash.
 
 ```
-Browser dashboard ──HTTP──> Raspberry Pi (pi/web_app.py) ──USB serial──> ESP32 (src/, PlatformIO) ──> servo + rain sensor
+Browser dashboard ──HTTP──> Raspberry Pi (pi/carwash) ──USB serial──> ESP32 (firmware/motor_rain_controller) ──> servo + rain sensor
 ```
 
 - Bay 1 is the real ESP32 test bay: a positional servo and a rain sensor, reached through the `Esp32Link` USB serial client. A run turns the servo from 0° to 180°, holds it for the chosen time, and the ESP32 turns it back to 0° on its own timer.
@@ -13,16 +13,17 @@ Browser dashboard ──HTTP──> Raspberry Pi (pi/web_app.py) ──USB seria
 
 | Folder | What's in it |
 |---|---|
-| `src/main.cpp`, `include/config.h`, `platformio.ini` | ESP32 firmware (PlatformIO project), documented below |
-| `pi/` | Raspberry Pi code: the web dashboard (`web_app.py`, `database.py`, `static/`), the serial client `esp32_link.py`, and command-line tools. See [Pi setup, launch, architecture, and simulator instructions](./pi/README.md). |
+| `firmware/motor_rain_controller/` | ESP32 firmware: `motor_rain_controller.ino` and its pins/limits in `config.h`. One sketch for both PlatformIO and the Arduino IDE. Documented below. |
+| `platformio.ini` | PlatformIO project settings (board, libraries); points at the firmware folder |
+| `pi/` | Raspberry Pi code: the `carwash` package (web interface, controllers, storage, ESP32 serial client), command-line tools, and tests. See [Pi setup, architecture, and launch](./pi/README.md). |
 
 ## Firmware
 
 **Build and upload:** open the repo folder in VS Code with the **PlatformIO** extension, then click **Upload** (→), or run `pio run -t upload`. The board is the **Adafruit Feather ESP32 V2**. PlatformIO installs the libraries (ArduinoJson 7, ESP32Servo 3) automatically. Only one program can use the port at a time: if the dashboard is running, press **Disconnect** on its Maintenance page before uploading, and close any serial monitor before connecting the dashboard.
 
-**Arduino IDE instead:** open `esp32/motor_rain_controller/motor_rain_controller.ino`. It is the same firmware as `src/main.cpp` with the `config.h` settings written into the sketch, so it compiles on its own. Install ArduinoJson 7 and ESP32Servo 3 from the Library Manager first.
+**Arduino IDE instead:** open `firmware/motor_rain_controller/motor_rain_controller.ino` (the IDE picks up `config.h` from the same folder). Install ArduinoJson 7 and ESP32Servo 3 from the Library Manager first. It's the same file PlatformIO builds, so there's only one copy of the firmware to keep up to date.
 
-### Wiring (pins in `include/config.h`)
+### Wiring (pins in `firmware/motor_rain_controller/config.h`)
 
 | ESP32 pin | Goes to | Notes |
 |---|---|---|
