@@ -7,7 +7,7 @@
 Servo myServo;
 int currentAngle = 0;
 
-char line[256];                     // incoming line from the Pi
+char line[256];                     
 size_t lineLen = 0;
 
 // ---------------- sending ----------------
@@ -26,7 +26,6 @@ void sendServoEvent(int angle) {
 }
 
 void setServoAngle(int angle) {
-  // Constrain to safe servo limits (0 to 180 degrees)
   angle = constrain(angle, 0, 180);
   currentAngle = angle;
   myServo.write(currentAngle);
@@ -41,23 +40,41 @@ void fillServoStatus(JsonObject o) {
 void fillRainReading(JsonObject o) {
   long sum = 0;
   for (int i = 0; i < RAIN_SAMPLES; i++) {
-    sum += analogRead(RAIN_ANALOG_PIN);   // 0..4095 (12-bit ADC)
+    sum += analogRead(RAIN_ANALOG_PIN);   
     delay(2);
   }
   int raw = sum / RAIN_SAMPLES;
-
-  // On these modules the voltage DROPS as the plate gets wetter:
   float wet = (4095 - raw) * 100.0f / 4095.0f;
 
   o["raw"] = raw;
-  o["wet_percent"] = round(wet * 10) / 10.0;          // one decimal place
+  o["wet_percent"] = round(wet * 10) / 10.0;          
   o["raining"] = digitalRead(RAIN_DIGITAL_PIN) == LOW;
+}
+
+// ---------------- ultrasonic sensor ----------------
+void fillDistanceReading(JsonObject o) {
+  digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  
+  digitalWrite(ULTRASONIC_TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
+
+  long duration = pulseIn(ULTRASONIC_ECHO_PIN, HIGH, 30000);
+  
+  float distance_cm = -1.0;
+  if (duration > 0) {
+    distance_cm = (duration * 0.0343f) / 2.0f;
+    distance_cm = round(distance_cm * 10) / 10.0; 
+  }
+
+  o["distance_cm"] = distance_cm;
 }
 
 // ---------------- request handling ----------------
 void handleRequest(const char* text, size_t len) {
   JsonDocument req;
-  if (deserializeJson(req, text, len)) return;       // not JSON: ignore
+  if (deserializeJson(req, text, len)) return;       
 
   String cmd = req["cmd"] | "";
   bool ok = true;
@@ -65,7 +82,7 @@ void handleRequest(const char* text, size_t len) {
 
   JsonDocument reply;
   reply["type"] = "reply";
-  reply["id"] = req["id"];                           // echo the id so the Pi can match it
+  reply["id"] = req["id"];                           
   JsonObject data = reply["data"].to<JsonObject>();
 
   if (cmd == "servo_set") {
@@ -83,6 +100,9 @@ void handleRequest(const char* text, size_t len) {
 
   } else if (cmd == "rain") {
     fillRainReading(data);
+
+  } else if (cmd == "distance") {
+    fillDistanceReading(data);
 
   } else if (cmd == "ping") {
     data["uptime_s"] = millis() / 1000.0;
@@ -106,7 +126,7 @@ void readSerial() {
     } else if (lineLen < sizeof(line) - 1) {
       line[lineLen++] = c;
     } else {
-      lineLen = 0;                                   // too long: drop it
+      lineLen = 0;                                   
     }
   }
 }
@@ -116,11 +136,13 @@ void setup() {
   Serial.begin(SERIAL_BAUD);
   delay(100);
 
-  // Attach the MS18 servo to the signal pin defined in config.h (MOTOR_PIN)
   myServo.attach(MOTOR_PIN);
-  setServoAngle(0); // Initialize to 0 degrees on boot
+  setServoAngle(0); 
 
   pinMode(RAIN_DIGITAL_PIN, INPUT);
+  pinMode(ULTRASONIC_TRIG_PIN, OUTPUT);
+  pinMode(ULTRASONIC_ECHO_PIN, INPUT);
+  
   analogReadResolution(12);
 
   JsonDocument ready;
