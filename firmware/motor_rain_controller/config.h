@@ -4,7 +4,7 @@
 // ---------------- Servo (positional, e.g. MS18 / SG90 / MG996R) ----------------
 // Signal wire (orange / yellow / white) goes to this pin.
 // Power the servo from its OWN 5 V supply, and connect that supply's GND to the ESP32's GND.
-#define SERVO_PIN 27
+#define SERVO_PIN 25
 
 #define SERVO_REST_ANGLE   0     // where the servo goes at power-up
                                  // (a timed hold returns to whatever angle it started from)

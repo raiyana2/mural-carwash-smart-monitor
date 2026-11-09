@@ -13,7 +13,7 @@ Browser dashboard ──HTTP──> Raspberry Pi (pi/carwash) ──USB serial�
 
 | Folder | What's in it |
 |---|---|
-| `firmware/motor_rain_controller/` | ESP32 firmware: `motor_rain_controller.ino` and its pins/limits in `config.h`. One sketch for both PlatformIO and the Arduino IDE. Documented below. |
+| `firmware/motor_rain_controller/` | ESP32 firmware: the code in `src/main.cpp` and its pins/limits in `config.h`. PlatformIO builds `src/main.cpp` directly; the empty `motor_rain_controller.ino` lets the Arduino IDE open the same code. Documented below. |
 | `platformio.ini` | PlatformIO project settings (board, libraries); points at the firmware folder |
 | `pi/` | Raspberry Pi code: the `carwash` package (web interface, controllers, storage, ESP32 serial client), command-line tools, and tests. See [Pi setup, architecture, and launch](./pi/README.md). |
 
@@ -21,7 +21,7 @@ Browser dashboard ──HTTP──> Raspberry Pi (pi/carwash) ──USB serial�
 
 **Build and upload:** open the repo folder in VS Code with the **PlatformIO** extension, then click **Upload** (→), or run `pio run -t upload`. The board is the **Adafruit Feather ESP32 V2**. PlatformIO installs the libraries (ArduinoJson 7, ESP32Servo 3) automatically. Only one program can use the port at a time: if the dashboard is running, press **Disconnect** on its Maintenance page before uploading, and close any serial monitor before connecting the dashboard.
 
-**Arduino IDE instead:** open `firmware/motor_rain_controller/motor_rain_controller.ino` (the IDE picks up `config.h` from the same folder). Install ArduinoJson 7 and ESP32Servo 3 from the Library Manager first. It's the same file PlatformIO builds, so there's only one copy of the firmware to keep up to date.
+**Arduino IDE instead:** open `firmware/motor_rain_controller/motor_rain_controller.ino`. That file is empty on purpose: the Arduino IDE also compiles the sketch's `src/` folder, so it builds the same `src/main.cpp` that PlatformIO does. Install ArduinoJson 7 and ESP32Servo 3 from the Library Manager first.
 
 ### Wiring (pins in `firmware/motor_rain_controller/config.h`)
 
