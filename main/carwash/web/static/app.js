@@ -584,7 +584,7 @@ function bayExtraHTML(bay) {
 function mountBays(data, params) {
   pageContext.textContent = "Bay Manager";
   app.innerHTML = `
-    <div class="page-heading"><div><p class="eyebrow">BAY MANAGER <span class="heading-dot"></span> WASH CONTROL</p><h1>Bay Manager</h1><p class="subheading">Choose a wash time and press <b>Start wash</b>: the bay's valve opens (the servo turns to 180°), stays open for the time paid for, then closes. Set what a minute costs under <b>Price per minute</b>; washes can run up to 60 minutes.</p></div><span class="demo-banner">Bay 1 hardware · Bays 2–11 simulated</span></div>
+    <div class="page-heading"><div><p class="eyebrow">BAY MANAGER <span class="heading-dot"></span> WASH CONTROL</p><h1>Bay Manager</h1></div><span class="demo-banner">Bay 1 hardware · Bays 2–11 simulated</span></div>
     ${pricePanel(data.bays)}
     <div class="bay-cards">${data.bays.map(bayCard).join("")}</div>
     <p class="helper-text">Bay 1's timer runs on the ESP32 itself, so its valve still closes on time if this page, the computer, or the USB cable drops.</p>`;
