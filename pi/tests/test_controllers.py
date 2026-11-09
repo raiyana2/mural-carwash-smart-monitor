@@ -6,6 +6,7 @@ from unittest.mock import patch
 from carwash.controllers import ControllerError, MonitorController
 from carwash.hardware.esp32_link import Esp32ConnectError
 from carwash.storage.database import MonitorDatabase
+from carwash.config import BUTTON_RUN_SECONDS
 from tests.helpers import StubLink, connected_controller
 
 
@@ -30,10 +31,10 @@ class MonitorControllerTests(unittest.TestCase):
         self.assertEqual(result["source"], "simulator")
         session = result["sessions"][0]
         self.assertNotEqual(session["purchased_seconds"], session["granted_seconds"])
-        self.assertEqual(session["anomaly_estimate_cents"], 300)
+        self.assertEqual(session["anomaly_estimate_cents"], 400)   # bought 5 min ($5), got 30 s ($1)
         self.assertEqual(result["faults"][0]["fault_type"], "purchased_granted_mismatch")
-        self.assertEqual(self.database.dashboard()["simulated_revenue_cents"], 800)
-        self.assertEqual(self.database.analytics()["totals"]["anomaly_estimate_cents"], 300)
+        self.assertEqual(self.database.dashboard()["simulated_revenue_cents"], 500)
+        self.assertEqual(self.database.analytics()["totals"]["anomaly_estimate_cents"], 400)
 
     def test_hardware_sensor_data_is_unknown_until_a_fresh_real_reading_exists(self):
         controller = MonitorController(
@@ -101,6 +102,89 @@ class ConnectionTests(unittest.TestCase):
             hardware = controller.dashboard()["hardware"]
             self.assertEqual(hardware["last_error_kind"], "no_answer")
             self.assertGreaterEqual(hardware["retry_in_s"], 15)
+
+
+
+class Bay1SensorTests(unittest.TestCase):
+    """The ultrasonic sensor, the button and the LCD on Bay 1's ESP32."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+
+    def poll(self, controller):
+        with controller._lock:
+            controller.hardware._next_distance_at = 0
+            controller.hardware.poll_locked()
+
+    def test_ultrasonic_reading_says_whether_a_car_is_in_the_bay(self):
+        link = StubLink()
+        controller = connected_controller(self.temp_dir.name, link)
+        for distance, present in ((23.5, True), (180.0, False), (None, False)):
+            link.distance_cm = distance
+            self.poll(controller)
+            bay1 = controller.dashboard()["bays"][0]
+            self.assertEqual(bay1["distance_cm"], distance)
+            self.assertEqual(bay1["vehicle_present"], int(present))
+            self.assertEqual(bay1["vehicle_sensor_installed"], 1)
+
+    def test_older_firmware_without_the_new_sensors_still_works(self):
+        link = StubLink(features={"motor", "rain"})
+        controller = connected_controller(self.temp_dir.name, link)
+        self.poll(controller)
+        bay1 = controller.dashboard()["bays"][0]
+        self.assertIsNone(bay1["vehicle_present"])
+        self.assertEqual(bay1["vehicle_sensor_installed"], 0)
+        self.assertFalse(any(call[0] in ("distance", "lcd_text") for call in link.calls))
+        self.assertEqual(controller.start_session(1, 5)["servo_angle"], 180)
+
+    def test_button_press_starts_a_run(self):
+        link = StubLink()
+        controller = connected_controller(self.temp_dir.name, link)
+        woken = []
+        controller.hardware.wake = lambda: woken.append(True)
+        controller.hardware._on_esp_event({"type": "event", "event": "button", "pressed": True})
+        self.assertEqual(woken, [True])
+        self.poll(controller)
+        self.assertIn(("motor_on", BUTTON_RUN_SECONDS, 180), link.calls)
+        bay1 = controller.bay_detail(1)
+        self.assertEqual(bay1["servo_angle"], 180)
+        self.assertTrue(any(s["status"] == "active" for s in bay1["sessions"]))
+        self.assertIn("Started", controller.dashboard()["hardware"]["last_button_result"])
+
+        # Pressing again while it runs doesn't start a second run.
+        controller.hardware._on_esp_event({"type": "event", "event": "button", "pressed": True})
+        self.poll(controller)
+        self.assertEqual(sum(1 for call in link.calls if call[0] == "motor_on"), 1)
+        self.assertIn("Ignored", controller.dashboard()["hardware"]["last_button_result"])
+
+    def test_button_is_ignored_when_the_bay_is_out_of_service(self):
+        link = StubLink()
+        controller = connected_controller(self.temp_dir.name, link)
+        controller.set_enabled(1, False)
+        controller.hardware._on_esp_event({"type": "event", "event": "button", "pressed": True})
+        self.poll(controller)
+        self.assertFalse(any(call[0] == "motor_on" for call in link.calls))
+        self.assertIn("out of service", controller.dashboard()["hardware"]["last_button_result"])
+
+    def test_lcd_follows_the_bay_and_is_only_sent_when_it_changes(self):
+        link = StubLink()
+        controller = connected_controller(self.temp_dir.name, link)
+        self.poll(controller)
+        self.assertEqual(link.lcd, ["$1.00 per minute", "Max 60 min"])
+        sent = sum(1 for call in link.calls if call[0] == "lcd_text")
+        self.poll(controller)
+        self.assertEqual(sum(1 for call in link.calls if call[0] == "lcd_text"), sent)
+
+        controller.set_enabled(1, False)
+        self.poll(controller)
+        self.assertEqual(link.lcd, ["Out of service", ""])
+        controller.set_enabled(1, True)
+        self.poll(controller)
+        self.assertEqual(link.lcd[0], "$1.00 per minute")
+
+        controller.disconnect_hardware()
+        self.assertEqual(link.lcd, ["Bay 1 offline", ""])
 
 
 if __name__ == "__main__":

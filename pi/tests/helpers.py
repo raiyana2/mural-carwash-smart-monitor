@@ -13,15 +13,28 @@ from carwash.storage.database import MonitorDatabase
 from carwash.web.app import app
 
 
+ALL_FEATURES = frozenset({"motor", "rain", "distance", "button", "lcd"})
+
+
 class StubLink:
-    """Stands in for Esp32Link: behaves like the servo firmware (servo_set refused during a run)."""
+    """Stands in for Esp32Link: behaves like the firmware (servo_set refused during a run).
+    `features` defaults to everything the current firmware has; pass {"motor", "rain"}
+    to act like the older firmware without the ultrasonic sensor, button and LCD."""
 
     port = "STUB"
     connected = True
 
-    def __init__(self, angle=0):
+    def __init__(self, angle=0, features=ALL_FEATURES):
         self.angle, self.running, self.calls = angle, False, []
         self.refuse_motor_on = None
+        self.features = frozenset(features)
+        self.firmware_version = 2 if "lcd" in self.features else None
+        self.distance_cm = 120.0                 # what read_distance() returns; None = no echo
+        self.rain_wet = 51.2                     # rain sensor wetness %, read as water flow
+        self.lcd = ["", ""]
+
+    def has(self, feature):
+        return feature in self.features
 
     def _status(self):
         return MotorStatus(running=self.running, remaining_s=5.0 if self.running else 0.0, angle=self.angle)
@@ -36,8 +49,9 @@ class StubLink:
     def motor_status(self):
         return self._status()
 
-    def motor_on(self, seconds, angle=None):
+    def motor_on(self, seconds, angle=None, label=None):
         self.calls.append(("motor_on", seconds, angle))
+        self.last_label = label
         if self.refuse_motor_on:
             raise Esp32Error(self.refuse_motor_on)
         if self.running:
@@ -55,7 +69,21 @@ class StubLink:
         return 12.0
 
     def read_rain(self):
-        return RainReading(raw=2000, wet_percent=51.2, raining=False)
+        return RainReading(raw=int(4095 - self.rain_wet * 40.95), wet_percent=self.rain_wet,
+                           raining=self.rain_wet > 50)
+
+    def read_distance(self):
+        if not self.has("distance"):
+            raise Esp32Error("unknown cmd 'distance'")
+        self.calls.append(("distance",))
+        return self.distance_cm
+
+    def lcd_text(self, row, text):
+        if not self.has("lcd"):
+            raise Esp32Error("unknown cmd 'lcd_text'")
+        self.calls.append(("lcd_text", row, text))
+        self.lcd[row] = text[:16]
+        return self.lcd[row]
 
     def close(self):
         pass

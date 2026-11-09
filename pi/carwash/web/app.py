@@ -10,7 +10,7 @@ into an HTTP error here. Run it from the pi folder:
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -20,6 +20,7 @@ from carwash.web.schemas import (
     EnabledRequest,
     PreviewRequest,
     ScenarioRequest,
+    ServicedRequest,
     SessionRequest,
     SettingsRequest,
 )
@@ -117,6 +118,21 @@ def simulator_scenario(request: ScenarioRequest) -> dict:
 @app.get("/api/analytics")
 def analytics() -> dict:
     return controller.analytics()
+
+
+@app.get("/api/reports")
+def financial_report(days: int = Query(30, ge=1, le=365)) -> dict:
+    return controller.financial_report(days)
+
+
+@app.get("/api/maintenance")
+def maintenance_report() -> dict:
+    return controller.maintenance_report()
+
+
+@app.post("/api/maintenance/{bay_number}/serviced")
+def mark_serviced(bay_number: int, request: ServicedRequest) -> dict:
+    return controller.mark_serviced(bay_number, request.equipment)
 
 
 @app.get("/api/faults")

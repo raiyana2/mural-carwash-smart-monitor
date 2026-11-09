@@ -11,10 +11,15 @@ Then type commands at the  esp32>  prompt:
     off         end a timed hold now (back to where it was)
     status      is it holding? how long is left? what angle?
     rain        read the rain sensor once
-    watch 2     read the rain sensor every 2 seconds (Ctrl+C to stop)
-    ping        check the ESP32 is answering
+    distance    read the ultrasonic sensor once
+    button      is the button held down right now?
+    lcd 0 Hello put "Hello" on LCD row 0 (or 1)
+    lcdclear    blank the LCD
+    backlight on|off
+    watch 2     read the sensors every 2 seconds (Ctrl+C to stop)
+    ping        check the ESP32 is answering and list its features
     quit
-Motor start/stop messages from the ESP32 are printed as they happen.
+Motor start/stop messages and button presses from the ESP32 are printed as they happen.
 """
 import argparse
 import cmd
@@ -30,12 +35,18 @@ def print_event(evt: dict) -> None:
         reasons = {"started": "started", "timer": "time is up", "stopped": "stopped by command"}
         angle = f" (servo at {evt['angle']}°)" if "angle" in evt else ""
         print(f"\n  [motor {state}] {reasons.get(evt.get('reason'), evt.get('reason'))}{angle}")
+    elif evt.get("event") == "button":
+        print("\n  [button pressed]")
     elif evt.get("event") == "ready":
         print("\n  [ESP32 restarted]")
 
 
 def describe_rain(r) -> str:
     return f"wet {r.wet_percent:5.1f}%  raw {r.raw:4d}  {'RAINING' if r.raining else 'dry'}"
+
+
+def describe_distance(cm) -> str:
+    return "nothing in range" if cm is None else f"{cm:5.1f} cm"
 
 
 class Shell(cmd.Cmd):
@@ -93,21 +104,52 @@ class Shell(cmd.Cmd):
         """rain : read the rain sensor once"""
         print("  " + describe_rain(self.esp.read_rain()))
 
+    def do_distance(self, arg):
+        """distance : read the ultrasonic sensor once"""
+        print("  " + describe_distance(self.esp.read_distance()))
+
+    def do_button(self, arg):
+        """button : is the button held down right now? (presses are also printed as they happen)"""
+        print("  pressed" if self.esp.read_button() else "  not pressed")
+
+    def do_lcd(self, arg):
+        """lcd ROW TEXT : show TEXT on LCD row 0 or 1 (16 characters)"""
+        row, _, text = arg.partition(" ")
+        if row not in ("0", "1"):
+            print("  usage: lcd ROW TEXT   (ROW is 0 or 1)")
+            return
+        print(f"  LCD row {row}: {self.esp.lcd_text(int(row), text)!r}")
+
+    def do_lcdclear(self, arg):
+        """lcdclear : blank the LCD"""
+        self.esp.lcd_clear()
+        print("  LCD cleared")
+
+    def do_backlight(self, arg):
+        """backlight on|off : turn the LCD backlight on or off"""
+        if arg.strip() not in ("on", "off"):
+            print("  usage: backlight on|off")
+            return
+        self.esp.lcd_backlight(arg.strip() == "on")
+        print(f"  backlight {arg.strip()}")
+
     def do_watch(self, arg):
-        """watch [SECONDS] : read the rain sensor every SECONDS (default 1) until Ctrl+C"""
+        """watch [SECONDS] : read the sensors every SECONDS (default 1) until Ctrl+C"""
         every = float(arg) if arg.strip() else 1.0
         print("  Ctrl+C to stop")
         while True:
             r = self.esp.read_rain()
+            distance = f"  {describe_distance(self.esp.read_distance())}" if self.esp.has("distance") else ""
             motor = "motor ON " if self.esp.motor_running else "motor off"
-            print(f"  {time.strftime('%H:%M:%S')}  {describe_rain(r)}  {motor}")
+            print(f"  {time.strftime('%H:%M:%S')}  {describe_rain(r)}{distance}  {motor}")
             time.sleep(every)
 
     def do_ping(self, arg):
-        """ping : check the ESP32 is answering"""
+        """ping : check the ESP32 is answering, and list what its firmware has"""
         t = time.monotonic()
         uptime = self.esp.ping()
         print(f"  pong in {(time.monotonic() - t) * 1000:.0f} ms (ESP32 up {uptime:.0f} s)")
+        print(f"  firmware features: {', '.join(sorted(self.esp.features))}")
 
     def do_quit(self, arg):
         """quit : exit (a running motor keeps going until its timer ends)"""

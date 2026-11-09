@@ -7,7 +7,12 @@
         print(esp.motor_status())        # MotorStatus(running=True, remaining_s=4.9, angle=180)
         esp.wait_until_motor_stops()
         print(esp.read_rain())           # RainReading(raw=1830, wet_percent=55.3, raining=True)
+        print(esp.read_distance())       # 42.7 (cm), or None when nothing is in range
+        esp.lcd_text(0, "Bay 1 ready")   # first line of the LCD (16 characters)
         esp.servo_set(90)                # low-level: move to 90° and stay there
+        esp.features                     # what this firmware has, e.g. {"motor", "rain", "distance", "button", "lcd"}
+
+Button presses arrive as events: pass on_event and look for {"event": "button"}.
 
 How it works: every request gets a number ("id"). A background thread reads
 lines from the ESP32 and hands each reply to whoever is waiting for that id.
@@ -20,6 +25,7 @@ Esp32ConnectError with a message that says what to check.
 from __future__ import annotations
 
 import itertools
+from collections import deque
 import json
 import logging
 import os
@@ -177,6 +183,11 @@ class Esp32Link:
         self._motor_stopped = threading.Event()
         self._motor_stopped.set()
         self._angle: int | None = None
+        # Older firmware doesn't say what it has; it only knew the motor and rain sensor.
+        self.features: frozenset[str] = frozenset({"motor", "rain"})
+        self.firmware_version: int | None = None
+        self._bytes_received = 0                  # for diagnosing a silent board
+        self._other_lines: deque[str] = deque(maxlen=6)   # recent non-JSON lines (boot / crash messages)
 
     # ------------------------------------------------------------------
     # connect / disconnect
@@ -200,12 +211,7 @@ class Esp32Link:
             # after an upload, and give the firmware time to boot.
             if native or not self._pulse_reset() or not self._wait_for_answer(AFTER_RESET_TIMEOUT_S):
                 self.close()
-                raise Esp32ConnectError(
-                    f"{port} opened, but the ESP32 didn't answer. Check that this project's firmware "
-                    "(firmware/motor_rain_controller) is uploaded, that no upload or serial monitor is running, and that "
-                    "the board isn't stuck (press its RESET button, then connect again).",
-                    "no_answer", port,
-                )
+                raise Esp32ConnectError(self._no_answer_message(port), "no_answer", port)
         try:
             self.motor_status()  # learn the current motor state
         except Esp32Error as exc:
@@ -264,6 +270,33 @@ class Esp32Link:
                 continue
         return False
 
+    def _no_answer_message(self, port: str) -> str:
+        """Explain a silent board using whatever it did (or didn't) print."""
+        printed = " | ".join(self._other_lines)
+        low = printed.lower()
+        if self._bytes_received == 0:
+            return (f"{port} opened, but nothing at all came back from it, not even after a reset. "
+                    f"{port} may not be the ESP32 (Bluetooth serial ports look the same): unplug the "
+                    f"board and see which port disappears. {describe_ports()}")
+        if "brownout" in low:
+            return (f"The ESP32 on {port} keeps restarting because its power dips (brownout). This is "
+                    "almost always the servo drawing power from the board's USB 5 V: power the servo "
+                    "from its own 5 V supply and connect that supply's GND to the ESP32's GND. "
+                    f"The board printed: {printed}")
+        if "guru meditation" in low or "backtrace" in low or "abort()" in low or "assert failed" in low:
+            return (f"The firmware on {port} is crashing while it starts up, so it never gets as far "
+                    f"as answering. The board printed: {printed}")
+        if "waiting for download" in low or "download(" in low:
+            return (f"The ESP32 on {port} is sitting in its bootloader (upload mode) instead of running "
+                    f"the firmware. Press its RESET button and connect again. The board printed: {printed}")
+        if "rst:" in low or "ets " in low or "boot:" in low:
+            return (f"The ESP32 on {port} starts booting but the firmware never answers; it may be "
+                    "restarting over and over, or the upload didn't finish. Upload again and watch for "
+                    f"[SUCCESS]. The board printed: {printed}")
+        return (f"{port} opened and the board sent data, but no reply to the dashboard's requests. Check "
+                "that this project's firmware (firmware/motor_rain_controller) is uploaded and that no "
+                f"serial monitor is open. The board printed: {printed or '(only unreadable bytes)'}")
+
     def _pulse_reset(self) -> bool:
         """Reset a board with the usual auto-reset circuit. Returns False if the port has no modem lines."""
         try:
@@ -297,12 +330,21 @@ class Esp32Link:
     # commands
     # ------------------------------------------------------------------
     def ping(self, timeout: float | None = None) -> float:
-        """Returns the ESP32's uptime in seconds."""
-        return self._request("ping", timeout=timeout)["uptime_s"]
+        """Returns the ESP32's uptime in seconds (and learns which features the firmware has)."""
+        data = self._request("ping", timeout=timeout)
+        if "features" in data:
+            self.features = frozenset(data["features"])
+            self.firmware_version = data.get("version")
+        return data["uptime_s"]
 
-    def motor_on(self, seconds: float, angle: int | None = None) -> MotorStatus:
+    def has(self, feature: str) -> bool:
+        """True if the firmware reported this feature ("motor", "rain", "distance", "button", "lcd")."""
+        return feature in self.features
+
+    def motor_on(self, seconds: float, angle: int | None = None, label: str | None = None) -> MotorStatus:
         """Move the servo to `angle` (default: the firmware's SERVO_ACTIVE_ANGLE, 180°),
-        hold it for `seconds`, then the ESP32 turns it back to the angle it was at before, by itself."""
+        hold it for `seconds`, then the ESP32 turns it back to the angle it was at before, by itself.
+        `label` (16 characters) is shown on the LCD's first line during the run, above the countdown."""
         if seconds <= 0:
             raise ValueError("seconds must be > 0")
         if angle is not None and not 0 <= angle <= 180:
@@ -310,6 +352,8 @@ class Esp32Link:
         fields = {"seconds": seconds}
         if angle is not None:
             fields["angle"] = int(angle)
+        if label:
+            fields["label"] = str(label)[:16]
         return self._motor_reply(self._request("motor_on", **fields))
 
     def motor_off(self) -> MotorStatus:
@@ -338,6 +382,28 @@ class Esp32Link:
     def read_rain(self) -> RainReading:
         d = self._request("rain")
         return RainReading(raw=d["raw"], wet_percent=d["wet_percent"], raining=d["raining"])
+
+    def read_distance(self) -> float | None:
+        """Ultrasonic distance to the nearest object in cm, or None if nothing echoed back (out of range)."""
+        cm = self._request("distance")["distance_cm"]
+        return None if cm is None or cm < 0 else float(cm)
+
+    def read_button(self) -> bool:
+        """True while the button is held down. (Presses also arrive as "button" events.)"""
+        return bool(self._request("button")["pressed"])
+
+    def lcd_text(self, row: int, text: str) -> str:
+        """Show `text` on LCD row 0 or 1 (cut to 16 characters). During a timed run the
+        firmware shows its countdown instead and puts this text back when the run ends."""
+        if row not in (0, 1):
+            raise ValueError("row must be 0 or 1")
+        return self._request("lcd_text", row=row, text=str(text))["text"]
+
+    def lcd_clear(self) -> None:
+        self._request("lcd_clear")
+
+    def lcd_backlight(self, on: bool = True) -> None:
+        self._request("lcd_backlight", on=bool(on))
 
     @property
     def connected(self) -> bool:
@@ -419,6 +485,7 @@ class Esp32Link:
             if not chunk:
                 continue
             buf += chunk
+            self._bytes_received += len(chunk)
             while b"\n" in buf:
                 raw, buf = buf.split(b"\n", 1)
                 self._handle_line(raw)
@@ -428,7 +495,9 @@ class Esp32Link:
     def _handle_line(self, raw: bytes) -> None:
         text = raw.decode("utf-8", errors="replace").strip()
         if not text.startswith("{"):
-            return  # boot messages from the ESP32 chip etc.
+            if text:
+                self._other_lines.append(text[:160])  # boot or crash messages: kept for diagnosis
+            return
         try:
             msg = json.loads(text)
         except json.JSONDecodeError:

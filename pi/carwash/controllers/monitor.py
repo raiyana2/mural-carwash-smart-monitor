@@ -17,6 +17,7 @@ import time
 from typing import Optional
 
 from carwash.config import (
+    BUTTON_RUN_SECONDS,
     HARDWARE_BAY,
     MAX_MOTOR_SECONDS,
     MOTOR_REST_ANGLE,
@@ -27,6 +28,7 @@ from carwash.config import (
 )
 from carwash.controllers.errors import ControllerError
 from carwash.controllers.hardware_bay import HardwareBay
+from carwash.controllers.maintenance import EQUIPMENT, MaintenanceAnalyzer
 from carwash.controllers.pricing import price_for_seconds
 from carwash.controllers.simulator import Simulator
 from carwash.storage.database import MonitorDatabase
@@ -47,9 +49,13 @@ class MonitorController:
         self.run_simulator = run_simulator
         self.seed_demo_data = seed_demo_data
         self._lock = threading.RLock()
-        self.hardware = HardwareBay(self.database, self._lock, serial_port, auto_connect)
-        self.simulator = Simulator(self.database, self.start_session, self.stop_session)
+        self.maintenance = MaintenanceAnalyzer(self.database)
+        self.hardware = HardwareBay(self.database, self._lock, serial_port, auto_connect, self.maintenance)
+        self.simulator = Simulator(self.database, self.start_session, self.stop_session, self.maintenance)
         self._stop = threading.Event()
+        self._wake = threading.Event()        # set to run the worker loop right away
+        self.hardware.wake = self._wake.set
+        self.hardware.on_button = self._on_button_press
         self._worker: Optional[threading.Thread] = None
         self._next_sim_at = 0.0
 
@@ -60,12 +66,14 @@ class MonitorController:
         self.database.initialize()
         if self.seed_demo_data:
             self.simulator.seed_demo_data()
+            self.simulator.seed_history()
         self._stop.clear()
         self._worker = threading.Thread(target=self._run, name="bay-monitor", daemon=True)
         self._worker.start()
 
     def close(self) -> None:
         self._stop.set()
+        self._wake.set()
         if self._worker:
             self._worker.join(timeout=3)
             self._worker = None
@@ -82,7 +90,20 @@ class MonitorController:
                         self._next_sim_at = time.time() + SIM_TICK_SECONDS
             except Exception:
                 log.exception("Bay monitor iteration failed")
-            self._stop.wait(POLL_SECONDS)
+            # Sleep until the next poll, or until a button press wakes us early.
+            self._wake.wait(POLL_SECONDS)
+            self._wake.clear()
+
+    def _on_button_press(self) -> None:
+        """Bay 1's physical button: start a run, unless the bay can't run right now.
+        Called by HardwareBay.poll_locked() with the lock held."""
+        try:
+            self.start_session(HARDWARE_BAY, BUTTON_RUN_SECONDS)
+            result = f"Started a {BUTTON_RUN_SECONDS} s run"
+        except ControllerError as exc:
+            result = f"Ignored: {exc}"
+        self.hardware.last_button_result = result
+        log.info("Bay %s button pressed: %s", HARDWARE_BAY, result)
 
     # ------------------------------------------------------------------
     # reading state
@@ -98,8 +119,15 @@ class MonitorController:
         result = self.database.dashboard()
         hardware = self.hardware.status()
         now = time.time()
+        midnight = time.mktime(time.localtime(now)[:3] + (0, 0, 0, 0, 0, -1))
+        cars_today = self.database.count_readings_by_bay("car", midnight)
+        last_flow = self.database.latest_reading_by_bay("flow")
         result["hardware"] = hardware
         result["bays"] = [self._decorate(bay, hardware, now) for bay in result["bays"]]
+        for bay in result["bays"]:
+            bay["cars_today"] = cars_today.get(bay["bay_number"], 0)
+            flow = last_flow.get(bay["bay_number"])
+            bay["last_wash_flow_lpm"] = flow["value"] if flow else None
         result["motor_run_angle"] = MOTOR_RUN_ANGLE
         result["motor_rest_angle"] = MOTOR_REST_ANGLE
         return result
@@ -119,6 +147,22 @@ class MonitorController:
 
     def analytics(self) -> dict:
         return self.database.analytics()
+
+    def financial_report(self, days: int) -> dict:
+        return self.database.financial_report(days)
+
+    def maintenance_report(self) -> dict:
+        return self.maintenance.report()
+
+    def mark_serviced(self, bay_number: int, equipment: str) -> dict:
+        """Record that a bay's water pump/nozzle, valve or car counter was serviced: its
+        health history starts again and its alerts are cleared."""
+        if equipment not in EQUIPMENT:
+            raise ControllerError(f"Unknown equipment '{equipment}'", "invalid")
+        with self._lock:
+            self._get_bay(bay_number)
+            self.maintenance.mark_serviced(bay_number, equipment)
+        return self.maintenance_report()
 
     def recent_faults(self, limit: int = 100) -> list[dict]:
         return self.database.recent_faults(limit)
@@ -196,7 +240,7 @@ class MonitorController:
             bay = self._get_bay(bay_number)
             if not enabled and (bay["status"] == "occupied" or bay["motor_running"]):
                 raise ControllerError(
-                    "Wait for the run to finish (or press Return now) before taking this bay out of service",
+                    "Wait for the wash to finish (or press Stop wash) before taking this bay out of service",
                     "conflict",
                 )
             self.database.update_bay(bay_number, {"enabled": int(enabled)})

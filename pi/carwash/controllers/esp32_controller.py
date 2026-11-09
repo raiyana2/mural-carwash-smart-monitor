@@ -67,6 +67,10 @@ class ControllerState:
     rain: RainReading | None = None
     rain_updated_at: datetime | None = None
 
+    distance_cm: float | None = None       # ultrasonic reading; None = nothing in range or no sensor
+    has_distance: bool = False             # the firmware has the ultrasonic sensor
+    last_button_at: datetime | None = None # last press of the bay's button
+
     log: tuple[LogEntry, ...] = field(default_factory=tuple)   # newest last
 
 
@@ -105,6 +109,9 @@ class Controller:
         self._motor_ends_at = 0.0              # time.monotonic() when the hold ends
         self._rain: RainReading | None = None
         self._rain_at: datetime | None = None
+        self._distance_cm: float | None = None
+        self._has_distance = False
+        self._button_at: datetime | None = None
 
         self._last_connect_error: str | None = None
 
@@ -157,6 +164,9 @@ class Controller:
                 motor_remaining_s=round(remaining, 1),
                 rain=self._rain,
                 rain_updated_at=self._rain_at,
+                distance_cm=self._distance_cm,
+                has_distance=self._has_distance,
+                last_button_at=self._button_at,
                 log=tuple(self._log),
             )
 
@@ -302,9 +312,12 @@ class Controller:
 
     def _poll(self, link: Esp32Link) -> None:
         rain = link.read_rain()
+        distance = link.read_distance() if link.has("distance") else None
         with self._lock:
             self._rain = rain
             self._rain_at = datetime.now()
+            self._distance_cm = distance
+            self._has_distance = link.has("distance")
 
     def _on_event(self, evt: dict) -> None:
         """Called by Esp32Link's reader thread for every event from the ESP32."""
@@ -332,6 +345,10 @@ class Controller:
                     self._motor_ends_at = 0.0
             if running:
                 return  # start of a timed hold: the start_motor reply sends the update
+        elif evt.get("event") == "button":
+            with self._lock:
+                self._button_at = datetime.now()
+            self._add_log("Button pressed")
         elif evt.get("event") == "ready":
             with self._lock:
                 self._motor_running = False

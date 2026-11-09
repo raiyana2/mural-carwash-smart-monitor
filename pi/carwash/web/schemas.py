@@ -38,3 +38,7 @@ class PreviewRequest(BaseModel):
 class ScenarioRequest(BaseModel):
     bay_number: int = Field(ge=2, le=BAY_COUNT)
     scenario: str
+
+
+class ServicedRequest(BaseModel):
+    equipment: str

@@ -1,4 +1,4 @@
-"""SQLite persistence for bays, pricing, wash sessions, and incidents."""
+"""SQLite persistence for bays, pricing, wash sessions, incidents, sensor history and reports."""
 
 import sqlite3
 import time
@@ -6,7 +6,14 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator, Optional
 
-from carwash.config import BAY_COUNT, DATABASE_PATH, HARDWARE_BAY
+from carwash.config import BAY_COUNT, DATABASE_PATH, HARDWARE_BAY, MAX_MOTOR_SECONDS, PRICE_PER_MINUTE_CENTS
+
+# Prices new bays start with: the per-minute price covers the first minute, and each
+# further minute (or part of one) costs the same again. So $1.00 = 1 minute by default.
+DEFAULT_PRICING = (PRICE_PER_MINUTE_CENTS, 60, PRICE_PER_MINUTE_CENTS, MAX_MOTOR_SECONDS)
+# What earlier versions gave new bays. Bays still on exactly these prices move to the new
+# defaults; a bay whose prices someone changed keeps them.
+OLD_DEFAULT_PRICING = (500, 120, 100, 300)
 
 
 class MonitorDatabase:
@@ -62,7 +69,9 @@ class MonitorDatabase:
                     motor_remaining_s REAL,
                     motor_updated_at REAL,
                     last_seen_at REAL,
-                    fault_message TEXT
+                    fault_message TEXT,
+                    distance_cm REAL,
+                    distance_updated_at REAL
                 );
 
                 CREATE TABLE IF NOT EXISTS pricing_settings (
@@ -103,13 +112,41 @@ class MonitorDatabase:
                     anomaly_estimate_cents INTEGER NOT NULL DEFAULT 0
                 );
 
+                -- Sensor history: kind 'flow' is one wash's average water flow in L/min
+                -- (value), kind 'car' is one car counted at the bay (value 1).
+                CREATE TABLE IF NOT EXISTS sensor_readings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    bay_number INTEGER NOT NULL REFERENCES bays(bay_number),
+                    source TEXT NOT NULL CHECK (source IN ('hardware', 'simulator')),
+                    kind TEXT NOT NULL,
+                    value REAL,
+                    recorded_at REAL NOT NULL
+                );
+
+                -- When a piece of equipment was last serviced; readings before that
+                -- don't count towards its health.
+                CREATE TABLE IF NOT EXISTS equipment_service (
+                    bay_number INTEGER NOT NULL REFERENCES bays(bay_number),
+                    equipment TEXT NOT NULL,
+                    serviced_at REAL NOT NULL,
+                    PRIMARY KEY (bay_number, equipment)
+                );
+
+                CREATE TABLE IF NOT EXISTS meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                );
+
                 CREATE INDEX IF NOT EXISTS sessions_bay_started
                     ON sessions(bay_number, started_at DESC);
                 CREATE INDEX IF NOT EXISTS faults_active_created
                     ON faults(active, created_at DESC);
-                PRAGMA user_version = 1;
+                CREATE INDEX IF NOT EXISTS sensor_readings_bay_kind_time
+                    ON sensor_readings(bay_number, kind, recorded_at);
+                PRAGMA user_version = 3;
                 """
             )
+            self._add_missing_columns(db)
             now = time.time()
             for number in range(1, BAY_COUNT + 1):
                 physical = number == HARDWARE_BAY
@@ -140,10 +177,32 @@ class MonitorDatabase:
                     INSERT OR IGNORE INTO pricing_settings (
                         bay_number, base_price_cents, included_seconds,
                         additional_price_per_minute_cents, maximum_duration_seconds, updated_at
-                    ) VALUES (?, 500, 120, 100, 300, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (number, now),
+                    (number, *DEFAULT_PRICING, now),
                 )
+            db.execute(
+                """
+                UPDATE pricing_settings SET base_price_cents = ?, included_seconds = ?,
+                    additional_price_per_minute_cents = ?, maximum_duration_seconds = ?, updated_at = ?
+                WHERE base_price_cents = ? AND included_seconds = ?
+                    AND additional_price_per_minute_cents = ? AND maximum_duration_seconds = ?
+                """,
+                (*DEFAULT_PRICING, now, *OLD_DEFAULT_PRICING),
+            )
+
+    # Columns added after the first version. A database made by an older version
+    # gets them here, so it keeps working without being deleted.
+    ADDED_COLUMNS = {
+        "bays": (("distance_cm", "REAL"), ("distance_updated_at", "REAL")),
+    }
+
+    def _add_missing_columns(self, db: sqlite3.Connection) -> None:
+        for table, columns in self.ADDED_COLUMNS.items():
+            existing = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
+            for name, sql_type in columns:
+                if name not in existing:
+                    db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
 
     def list_bays(self) -> list[dict]:
         with self.connection() as db:
@@ -433,6 +492,12 @@ class MonitorDatabase:
                 "SELECT COUNT(*) FROM sessions WHERE started_at >= ?", (midnight,)
             ).fetchone()[0]
             active_faults = db.execute("SELECT COUNT(*) FROM faults WHERE active = 1").fetchone()[0]
+            revenue_today = db.execute(
+                "SELECT COALESCE(SUM(price_cents), 0) FROM sessions WHERE started_at >= ?", (midnight,)
+            ).fetchone()[0]
+            cars_today = db.execute(
+                "SELECT COUNT(*) FROM sensor_readings WHERE kind = 'car' AND recorded_at >= ?", (midnight,)
+            ).fetchone()[0]
         return {
             "bays": bays,
             "simulated_revenue_cents": simulated_revenue,
@@ -443,8 +508,246 @@ class MonitorDatabase:
             "faulted_bays": sum(bay["status"] == "faulted" for bay in bays),
             "customer_visits": visits,
             "runs_today": runs_today,
+            "revenue_today_cents": revenue_today,
+            "cars_today": cars_today,
             "active_faults": active_faults,
             "recent_faults": self.recent_faults(),
+        }
+
+    # ------------------------------------------------------------------
+    # small key/value store (e.g. when the simulated history was added)
+    # ------------------------------------------------------------------
+    def get_meta(self, key: str) -> Optional[str]:
+        with self.connection() as db:
+            row = db.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+            return row["value"] if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self.connection() as db:
+            db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
+
+    # ------------------------------------------------------------------
+    # sensor history
+    # ------------------------------------------------------------------
+    def add_reading(self, bay_number: int, kind: str, value: Optional[float], source: str,
+                    recorded_at: Optional[float] = None) -> None:
+        with self.connection() as db:
+            db.execute(
+                "INSERT INTO sensor_readings (bay_number, source, kind, value, recorded_at) VALUES (?, ?, ?, ?, ?)",
+                (bay_number, source, kind, value, recorded_at or time.time()),
+            )
+
+    def add_readings(self, rows: list[tuple]) -> None:
+        """Bulk insert of (bay_number, source, kind, value, recorded_at)."""
+        with self.connection() as db:
+            db.executemany(
+                "INSERT INTO sensor_readings (bay_number, source, kind, value, recorded_at) VALUES (?, ?, ?, ?, ?)",
+                rows,
+            )
+
+    def readings(self, bay_number: int, kind: str, since: float = 0.0, limit: Optional[int] = None) -> list[dict]:
+        """Readings oldest first (or the newest `limit` of them, still oldest first)."""
+        with self.connection() as db:
+            if limit:
+                rows = db.execute(
+                    """
+                    SELECT * FROM (SELECT value, recorded_at FROM sensor_readings
+                        WHERE bay_number = ? AND kind = ? AND recorded_at >= ?
+                        ORDER BY recorded_at DESC LIMIT ?) ORDER BY recorded_at
+                    """,
+                    (bay_number, kind, since, limit),
+                ).fetchall()
+            else:
+                rows = db.execute(
+                    """
+                    SELECT value, recorded_at FROM sensor_readings
+                    WHERE bay_number = ? AND kind = ? AND recorded_at >= ? ORDER BY recorded_at
+                    """,
+                    (bay_number, kind, since),
+                ).fetchall()
+            return [dict(row) for row in rows]
+
+    def count_readings_by_bay(self, kind: str, since: float) -> dict[int, int]:
+        with self.connection() as db:
+            return {
+                row["bay_number"]: row["n"]
+                for row in db.execute(
+                    "SELECT bay_number, COUNT(*) AS n FROM sensor_readings WHERE kind = ? AND recorded_at >= ? GROUP BY bay_number",
+                    (kind, since),
+                )
+            }
+
+    def latest_reading_by_bay(self, kind: str) -> dict[int, dict]:
+        with self.connection() as db:
+            return {
+                row["bay_number"]: {"value": row["value"], "recorded_at": row["recorded_at"]}
+                for row in db.execute(
+                    """
+                    SELECT r.bay_number, r.value, r.recorded_at FROM sensor_readings r
+                    JOIN (SELECT bay_number, MAX(recorded_at) AS latest FROM sensor_readings
+                          WHERE kind = ? GROUP BY bay_number) m
+                      ON m.bay_number = r.bay_number AND m.latest = r.recorded_at
+                    WHERE r.kind = ?
+                    """,
+                    (kind, kind),
+                )
+            }
+
+    def count_sessions(self, bay_number: int, since: float = 0.0) -> int:
+        with self.connection() as db:
+            return db.execute(
+                "SELECT COUNT(*) FROM sessions WHERE bay_number = ? AND started_at >= ?", (bay_number, since)
+            ).fetchone()[0]
+
+    def mark_serviced(self, bay_number: int, equipment: str, when: Optional[float] = None) -> None:
+        with self.connection() as db:
+            db.execute(
+                "INSERT OR REPLACE INTO equipment_service (bay_number, equipment, serviced_at) VALUES (?, ?, ?)",
+                (bay_number, equipment, when or time.time()),
+            )
+
+    def serviced_at(self, bay_number: int, equipment: str) -> Optional[float]:
+        with self.connection() as db:
+            row = db.execute(
+                "SELECT serviced_at FROM equipment_service WHERE bay_number = ? AND equipment = ?",
+                (bay_number, equipment),
+            ).fetchone()
+            return row["serviced_at"] if row else None
+
+    def insert_history_sessions(self, rows: list[tuple]) -> None:
+        """Bulk insert of finished runs: (bay_number, source, wash_mode, seconds, price_cents,
+        started_at, ended_at). Used for the simulated history."""
+        with self.connection() as db:
+            db.executemany(
+                """
+                INSERT INTO sessions (bay_number, source, status, wash_mode, purchased_seconds,
+                    granted_seconds, price_cents, started_at, ended_at)
+                VALUES (?, ?, 'completed', ?, ?, ?, ?, ?, ?)
+                """,
+                [(b, src, mode, secs, secs, price, start, end) for b, src, mode, secs, price, start, end in rows],
+            )
+
+    # ------------------------------------------------------------------
+    # financial report
+    # ------------------------------------------------------------------
+    def financial_report(self, days: int, now: Optional[float] = None) -> dict:
+        """Revenue, washes and cars for the last `days` days (local calendar days, today included),
+        with totals for the same length of time before that for comparison."""
+        now = now or time.time()
+        today = time.localtime(now)
+        start_of_today = time.mktime(today[:3] + (0, 0, 0, 0, 0, -1))
+        since = time.mktime((today.tm_year, today.tm_mon, today.tm_mday - (days - 1), 0, 0, 0, 0, 0, -1))
+        previous_since = time.mktime((today.tm_year, today.tm_mon, today.tm_mday - (2 * days - 1), 0, 0, 0, 0, 0, -1))
+
+        def totals(db, start, end):
+            row = db.execute(
+                """
+                SELECT COUNT(*) AS washes,
+                    COALESCE(SUM(price_cents), 0) AS revenue_cents,
+                    COALESCE(SUM(CASE WHEN source = 'hardware' THEN price_cents ELSE 0 END), 0) AS hardware_revenue_cents,
+                    COALESCE(SUM(CASE WHEN source = 'simulator' THEN price_cents ELSE 0 END), 0) AS simulated_revenue_cents,
+                    COALESCE(SUM(granted_seconds), 0) AS seconds_sold,
+                    COALESCE(SUM(anomaly_estimate_cents), 0) AS anomaly_estimate_cents
+                FROM sessions WHERE started_at >= ? AND started_at < ?
+                """,
+                (start, end),
+            ).fetchone()
+            result = dict(row)
+            result["cars"] = db.execute(
+                "SELECT COUNT(*) FROM sensor_readings WHERE kind = 'car' AND recorded_at >= ? AND recorded_at < ?",
+                (start, end),
+            ).fetchone()[0]
+            result["avg_sale_cents"] = round(result["revenue_cents"] / result["washes"]) if result["washes"] else 0
+            result["revenue_per_car_cents"] = round(result["revenue_cents"] / result["cars"]) if result["cars"] else None
+            return result
+
+        with self.connection() as db:
+            period = totals(db, since, now + 1)
+            previous = totals(db, previous_since, since)
+            today_totals = totals(db, start_of_today, now + 1)
+            # Only compare with the previous period if the database goes back that far.
+            first = db.execute("SELECT MIN(started_at) FROM sessions").fetchone()[0]
+            previous_complete = first is not None and first <= previous_since + 86400
+
+            daily = {
+                row["day"]: dict(row)
+                for row in db.execute(
+                    """
+                    SELECT date(started_at, 'unixepoch', 'localtime') AS day, COUNT(*) AS washes,
+                        COALESCE(SUM(price_cents), 0) AS revenue_cents
+                    FROM sessions WHERE started_at >= ? GROUP BY day
+                    """,
+                    (since,),
+                )
+            }
+            cars_daily = {
+                row["day"]: row["cars"]
+                for row in db.execute(
+                    """
+                    SELECT date(recorded_at, 'unixepoch', 'localtime') AS day, COUNT(*) AS cars
+                    FROM sensor_readings WHERE kind = 'car' AND recorded_at >= ? GROUP BY day
+                    """,
+                    (since,),
+                )
+            }
+            days_list = []
+            for offset in range(days):
+                day_start = time.mktime((today.tm_year, today.tm_mon, today.tm_mday - (days - 1) + offset, 0, 0, 0, 0, 0, -1))
+                key = time.strftime("%Y-%m-%d", time.localtime(day_start))
+                entry = daily.get(key, {"washes": 0, "revenue_cents": 0})
+                days_list.append({"date": key, "washes": entry["washes"], "revenue_cents": entry["revenue_cents"],
+                                  "cars": cars_daily.get(key, 0)})
+
+            by_bay = []
+            hours_in_period = max(1.0, (now - since) / 3600)
+            cars_by_bay = {
+                row["bay_number"]: row["cars"]
+                for row in db.execute(
+                    "SELECT bay_number, COUNT(*) AS cars FROM sensor_readings WHERE kind = 'car' AND recorded_at >= ? GROUP BY bay_number",
+                    (since,),
+                )
+            }
+            for row in db.execute(
+                """
+                SELECT b.bay_number, b.label, b.source, COUNT(s.id) AS washes,
+                    COALESCE(SUM(s.price_cents), 0) AS revenue_cents,
+                    COALESCE(SUM(s.granted_seconds), 0) AS seconds_sold
+                FROM bays b LEFT JOIN sessions s ON s.bay_number = b.bay_number AND s.started_at >= ?
+                GROUP BY b.bay_number ORDER BY b.bay_number
+                """,
+                (since,),
+            ):
+                item = dict(row)
+                item["cars"] = cars_by_bay.get(item["bay_number"], 0)
+                item["avg_sale_cents"] = round(item["revenue_cents"] / item["washes"]) if item["washes"] else 0
+                item["utilization_percent"] = round(min(100.0, item["seconds_sold"] / 3600 / hours_in_period * 100), 1)
+                by_bay.append(item)
+
+            by_hour = {
+                int(row["hour"]): dict(row)
+                for row in db.execute(
+                    """
+                    SELECT strftime('%H', started_at, 'unixepoch', 'localtime') AS hour, COUNT(*) AS washes,
+                        COALESCE(SUM(price_cents), 0) AS revenue_cents
+                    FROM sessions WHERE started_at >= ? GROUP BY hour
+                    """,
+                    (since,),
+                )
+            }
+            hours = [{"hour": h, "washes": by_hour.get(h, {}).get("washes", 0),
+                      "revenue_cents": by_hour.get(h, {}).get("revenue_cents", 0)} for h in range(24)]
+
+        return {
+            "days": days,
+            "since": since,
+            "totals": period,
+            "previous": previous,
+            "previous_complete": previous_complete,
+            "data_since": first,
+            "today": today_totals,
+            "daily": days_list,
+            "by_bay": by_bay,
+            "by_hour": hours,
         }
 
     def analytics(self) -> dict:
